@@ -215,11 +215,18 @@ pub fn run_completion(
         let mut errored = false;
         // 最後一次使用的帳號（executor 內層重試會多次發 Meta，取最後一個）
         let mut last_email: Option<String> = None;
+        // 上游每個 phase 出現次數（診斷用：偶發「思考完啥都沒看到」時 dump 出來）
+        let mut phase_counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        // 跳過的 content 累積（phase 屬於 think / thinking_summary 時）—
+        // 若最終空回覆，這份能告訴我們上游把答案送到了哪個 phase。
+        let mut skipped_phase_content_chars: usize = 0;
 
         while let Some(ev) = upstream.next().await {
             match ev {
                 UpstreamEvent::Meta { email, .. } => { last_email = Some(email); }
                 UpstreamEvent::Delta(d) => {
+                    *phase_counts.entry(d.phase.clone()).or_insert(0) += 1;
                     // usage
                     if let Some(u) = &d.usage {
                         let (o, r) = parse_upstream_usage(u);
@@ -233,12 +240,16 @@ pub fn run_completion(
                         yield OutEvent::ReasoningDelta(rinc);
                     }
                     // content：收集所有非思考階段（answer / image_gen / t2v 影片 URL 等）
-                    if !d.content.is_empty() && d.phase != "think" && d.phase != "thinking_summary" {
-                        probe.mark_first_token();
-                        answer_buf.push_str(&d.content);
-                        if !has_tools {
-                            yield OutEvent::ContentDelta(d.content.clone());
-                            streamed_content = true;
+                    if !d.content.is_empty() {
+                        if d.phase != "think" && d.phase != "thinking_summary" {
+                            probe.mark_first_token();
+                            answer_buf.push_str(&d.content);
+                            if !has_tools {
+                                yield OutEvent::ContentDelta(d.content.clone());
+                                streamed_content = true;
+                            }
+                        } else {
+                            skipped_phase_content_chars += d.content.chars().count();
                         }
                     }
                 }
@@ -265,15 +276,49 @@ pub fn run_completion(
         }
 
         // 有工具時，緩衝的可見文字在此一次性送出（剝除工具標記）
+        let mut yielded_content_at_end = false;
         if has_tools && !streamed_content {
             let cleaned = strip_tool_calls(&answer_buf);
             let cleaned = cleaned.trim();
             if !cleaned.is_empty() {
                 yield OutEvent::ContentDelta(cleaned.to_string());
+                yielded_content_at_end = true;
             }
         }
         if !tool_calls.is_empty() {
             yield OutEvent::ToolCalls(tool_calls.clone());
+        }
+
+        // 保險網（fail-open）：has_tools 終局時，若 buffer 非空卻被 strip 清光、又沒解析出 tool_calls
+        // → 把原 buffer 當作 content yield 出去，至少 client 看得到上游回了什麼東西，
+        // 而不是收到「思考完突然 stop、零內容」的詭異體驗。
+        // 此分支理論上不應觸發（parser 已用 brace-balanced 處理多 JSON / 巢狀 / 未閉合），
+        // 留著是為了未來上游再出新格式時仍有最後一道防線。同時搭配下方診斷 log 留證。
+        if has_tools && !streamed_content && !yielded_content_at_end && tool_calls.is_empty()
+            && !answer_buf.trim().is_empty()
+        {
+            yield OutEvent::ContentDelta(answer_buf.clone());
+            yielded_content_at_end = true;
+        }
+
+        // 診斷：思考模型偶發「思考完客戶端啥都沒看到」。發生條件是：
+        // (a) 整輪結束無錯誤；(b) 沒串流出 content；(c) 終局沒一次性送 content；
+        // (d) 沒任何 tool_calls。warn log 把 phase 統計 + answer_buf 全文 + 解析後 cleaned 印出來，
+        // 用來判斷上游把答案送到了哪個 phase / parser 為什麼漏抓 tool_call。
+        let client_saw_nothing = !streamed_content && !yielded_content_at_end && tool_calls.is_empty();
+        if client_saw_nothing && has_tools {
+            let cleaned_full = crate::toolcall::strip_tool_calls(&answer_buf);
+            let cleaned_trim = cleaned_full.trim();
+            tracing::warn!(
+                "[執行編排] 客戶端零輸出 phases={phase_counts:?} skipped_phase_chars={skipped_phase_content_chars} answer_buf_chars={} cleaned_chars={} cleaned_is_empty={} last_email={:?} out_tokens={} reasoning_tokens={} answer_buf_full={:?}",
+                answer_buf.chars().count(),
+                cleaned_full.chars().count(),
+                cleaned_trim.is_empty(),
+                last_email,
+                last_out_tokens,
+                last_reasoning_tokens,
+                answer_buf,
+            );
         }
 
         // usage：completion 用上游 output_tokens（最準），prompt 用本地 tiktoken
