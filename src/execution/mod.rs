@@ -8,7 +8,7 @@ pub mod translator;
 use crate::request::StandardRequest;
 use crate::state::AppState;
 use crate::stats::{RequestRecord, Stats};
-use crate::toolcall::{parse_tool_calls, strip_tool_calls, ParsedToolCall};
+use crate::toolcall::{parse_tool_calls, strip_tool_calls_with, ParsedToolCall};
 use crate::upstream::{ImageOptions, StreamParams, UpstreamEvent};
 use crate::util::{char_len, now_millis};
 use async_stream::stream;
@@ -275,10 +275,10 @@ pub fn run_completion(
             tool_calls = parse_tool_calls(&answer_buf, &registry);
         }
 
-        // 有工具時，緩衝的可見文字在此一次性送出（剝除工具標記）
+        // 有工具時，緩衝的可見文字在此一次性送出（剝除工具標記＋裸 JSON tool_call）
         let mut yielded_content_at_end = false;
         if has_tools && !streamed_content {
-            let cleaned = strip_tool_calls(&answer_buf);
+            let cleaned = strip_tool_calls_with(&answer_buf, &registry);
             let cleaned = cleaned.trim();
             if !cleaned.is_empty() {
                 yield OutEvent::ContentDelta(cleaned.to_string());
@@ -307,7 +307,7 @@ pub fn run_completion(
         // 用來判斷上游把答案送到了哪個 phase / parser 為什麼漏抓 tool_call。
         let client_saw_nothing = !streamed_content && !yielded_content_at_end && tool_calls.is_empty();
         if client_saw_nothing && has_tools {
-            let cleaned_full = crate::toolcall::strip_tool_calls(&answer_buf);
+            let cleaned_full = crate::toolcall::strip_tool_calls_with(&answer_buf, &registry);
             let cleaned_trim = cleaned_full.trim();
             tracing::warn!(
                 "[執行編排] 客戶端零輸出 phases={phase_counts:?} skipped_phase_chars={skipped_phase_content_chars} answer_buf_chars={} cleaned_chars={} cleaned_is_empty={} last_email={:?} out_tokens={} reasoning_tokens={} answer_buf_full={:?}",
@@ -322,7 +322,7 @@ pub fn run_completion(
         }
 
         // usage：completion 用上游 output_tokens（最準），prompt 用本地 tiktoken
-        let visible = if has_tools { strip_tool_calls(&answer_buf) } else { answer_buf.clone() };
+        let visible = if has_tools { strip_tool_calls_with(&answer_buf, &registry) } else { answer_buf.clone() };
         let prompt_tokens = count_tokens(&prompt) as i64;
         let completion_tokens = if last_out_tokens > 0 { last_out_tokens } else { char_len(&visible) as i64 };
         let usage = Usage {

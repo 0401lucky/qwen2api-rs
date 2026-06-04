@@ -5,3 +5,5 @@
 .playwright-mcp/
 *.png
 /tmp
+
+.claude/

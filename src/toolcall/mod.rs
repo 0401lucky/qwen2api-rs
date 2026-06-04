@@ -232,11 +232,17 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// `<tool_call>{json1}\n{json2}</tool_call>`、未閉合的 `<tool_call>{json}…`、
 /// 以及 ```` ```tool_call ```` / ```` ```json ```` 圍欄；
 /// JSON 內含巢狀 `{}` 也能正確切（brace-balanced 掃描）。
+///
+/// **裸 JSON fallback**：thinking 模型偶發直接吐 `{"name":"foo","arguments":{...}}`
+/// 給 client 而沒包 `<tool_call>` 標籤。此時掃整段找符合條件的 JSON 物件視為隱式
+/// tool_call（必須 name 在 registry 內、且有 arguments/input/parameters 欄位），
+/// 避免 false-positive 把使用者真的想看的 JSON 文字當成呼叫。
 pub fn parse_tool_calls(text: &str, registry: &HashMap<String, String>) -> Vec<ParsedToolCall> {
     let bytes = text.as_bytes();
     let mut calls = Vec::new();
-    for (_, _, inner_start, inner_end) in find_tool_blocks(text) {
-        for (s, e) in split_json_objects(bytes, inner_start, inner_end) {
+    let blocks = find_tool_blocks(text);
+    for (_, _, inner_start, inner_end) in &blocks {
+        for (s, e) in split_json_objects(bytes, *inner_start, *inner_end) {
             let slice = match std::str::from_utf8(&bytes[s..=e]) {
                 Ok(v) => v,
                 Err(_) => continue, // brace 切點落在多 byte 中間（理論上不會）
@@ -246,7 +252,55 @@ pub fn parse_tool_calls(text: &str, registry: &HashMap<String, String>) -> Vec<P
             }
         }
     }
+    // 沒抓到任何 <tool_call> / 圍欄區塊 → 嘗試裸 JSON fallback。
+    // 只在 has_tools=true（registry 非空）才掃，避免無工具情境下誤判 JSON 文字。
+    if blocks.is_empty() && !registry.is_empty() {
+        calls.extend(parse_naked_json_tool_calls(text, registry));
+    }
     calls
+}
+
+/// 掃描 text 找符合「裸 tool_call JSON」的物件（無 `<tool_call>` 包裝）。
+/// 篩選條件（避免把使用者要回的普通 JSON 文字誤判為工具呼叫）：
+/// - 物件有 `name` 字串欄位，且 name 經 norm_key 後在 registry 內
+/// - 物件有 `arguments` / `input` / `parameters` 之一，且為 object 或 string
+fn parse_naked_json_tool_calls(text: &str, registry: &HashMap<String, String>) -> Vec<ParsedToolCall> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(end) = scan_json_object_end(bytes, i) {
+                if let Ok(slice) = std::str::from_utf8(&bytes[i..=end]) {
+                    if let Some(c) = parse_naked_one(slice, registry) {
+                        out.push(c);
+                    }
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn parse_naked_one(json_str: &str, registry: &HashMap<String, String>) -> Option<ParsedToolCall> {
+    let v: Value = serde_json::from_str(json_str).ok()?;
+    let raw_name = v.get("name").and_then(|x| x.as_str())?;
+    // name 必須在 registry 內，這是「裸 JSON」與「普通 JSON 文字」的核心區別
+    if !registry.contains_key(&norm_key(raw_name)) {
+        return None;
+    }
+    // 必須有 arguments-like 欄位且為 object/string，排除 schema 介紹型 JSON
+    let args_ok = ["arguments", "input", "parameters"]
+        .iter()
+        .filter_map(|k| v.get(*k))
+        .any(|f| f.is_object() || f.is_string());
+    if !args_ok {
+        return None;
+    }
+    parse_obj(&v, registry)
 }
 
 fn parse_one(json_str: &str, registry: &HashMap<String, String>) -> Option<ParsedToolCall> {
@@ -290,23 +344,56 @@ fn parse_obj(v: &Value, registry: &HashMap<String, String>) -> Option<ParsedTool
 }
 
 /// 移除文字中的 tool_call 標記（串流給客戶端的可見文字不應含這些）。
-/// 用 find_tool_blocks 找出每個區塊範圍，整段切除。
+/// 用 find_tool_blocks 找出每個區塊範圍，整段切除；若沒區塊但 registry 非空，
+/// 嘗試把符合「裸 tool_call JSON」條件的物件也剝除（與 parse_tool_calls 同條件，
+/// 避免 client 看到 `{"name":"Bash","arguments":{...}}` 這種裸 JSON）。
 pub fn strip_tool_calls(text: &str) -> String {
+    strip_tool_calls_with(text, &HashMap::new())
+}
+
+/// 同 `strip_tool_calls`，但帶 registry 以啟用裸 JSON 剝離。傳空 registry 等同舊行為。
+pub fn strip_tool_calls_with(text: &str, registry: &HashMap<String, String>) -> String {
     let blocks = find_tool_blocks(text);
-    if blocks.is_empty() {
+    let bytes = text.as_bytes();
+
+    let mut ranges: Vec<(usize, usize)> = blocks
+        .iter()
+        .map(|(open_start, block_end, _, _)| (*open_start, *block_end))
+        .collect();
+
+    // 沒抓到區塊但 registry 非空 → 找裸 JSON tool_call 並把整個 JSON 物件納入剝除範圍
+    if blocks.is_empty() && !registry.is_empty() {
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'{' {
+                if let Some(end) = scan_json_object_end(bytes, i) {
+                    if let Ok(slice) = std::str::from_utf8(&bytes[i..=end]) {
+                        if parse_naked_one(slice, registry).is_some() {
+                            ranges.push((i, end + 1));
+                        }
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    if ranges.is_empty() {
         return text.to_string();
     }
+    ranges.sort_by_key(|r| r.0);
+
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
-    let bytes = text.as_bytes();
-    for (open_start, block_end, _, _) in blocks {
-        if cursor < open_start {
-            // 留下區塊外的文字
-            if let Ok(s) = std::str::from_utf8(&bytes[cursor..open_start]) {
+    for (start, end) in ranges {
+        if cursor < start {
+            if let Ok(s) = std::str::from_utf8(&bytes[cursor..start]) {
                 out.push_str(s);
             }
         }
-        cursor = block_end;
+        cursor = end.max(cursor);
     }
     if cursor < bytes.len() {
         if let Ok(s) = std::str::from_utf8(&bytes[cursor..]) {
@@ -430,5 +517,85 @@ some text
         let calls = parse_tool_calls(text, &reg);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Bash", "應該還原為原始客戶端名");
+    }
+
+    fn registry_with(tools: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        for (qwen, canonical) in tools {
+            m.insert(norm_key(qwen), canonical.to_string());
+        }
+        m
+    }
+
+    /// 裸 JSON tool_call（無 <tool_call> 包裝）：thinking 模型偶發直接吐
+    /// `{"name":"u_ToolSearch","arguments":{...}}` 給 client。registry 內有此名
+    /// + 有 arguments → 視為 tool_call。
+    #[test]
+    fn naked_json_with_known_name_and_arguments_parses_as_tool_call() {
+        let reg = registry_with(&[("u_ToolSearch", "ToolSearch")]);
+        let text = r#"{"name": "u_ToolSearch", "arguments": {"query": "+tg notify"}}"#;
+        let calls = parse_tool_calls(text, &reg);
+        assert_eq!(calls.len(), 1, "裸 JSON 該被當 tool_call: {calls:?}");
+        assert_eq!(calls[0].name, "ToolSearch");
+        assert_eq!(calls[0].arguments["query"], "+tg notify");
+        // strip 應把裸 JSON 整段剝掉
+        assert!(strip_tool_calls_with(text, &reg).trim().is_empty());
+    }
+
+    /// 裸 JSON 但 name 不在 registry → 不視為 tool_call（保留為文字）。
+    /// 防護：避免 user 真的想要 JSON 文字時被誤判。
+    #[test]
+    fn naked_json_with_unknown_name_passes_through_as_text() {
+        let reg = registry_with(&[("Bash", "Bash")]); // 只認 Bash
+        let text = r#"{"name": "random_thing", "arguments": {"a": 1}}"#;
+        assert!(parse_tool_calls(text, &reg).is_empty());
+        assert_eq!(strip_tool_calls_with(text, &reg), text);
+    }
+
+    /// 裸 JSON 有 name 但沒 arguments / input / parameters → 不視為 tool_call。
+    /// 防護：避免把「工具介紹型 JSON」（如回答「Bash 是什麼工具」的描述）誤判。
+    #[test]
+    fn naked_json_without_args_field_passes_through() {
+        let reg = registry_with(&[("Bash", "Bash")]);
+        let text = r#"{"name": "Bash", "description": "Executes shell commands"}"#;
+        assert!(parse_tool_calls(text, &reg).is_empty(), "缺 arguments 該視為文字");
+        assert_eq!(strip_tool_calls_with(text, &reg), text);
+    }
+
+    /// has_tools=false（registry 空）→ 裸 JSON 一律不視為 tool_call。
+    #[test]
+    fn empty_registry_disables_naked_detection() {
+        let empty = HashMap::new();
+        let text = r#"{"name": "Bash", "arguments": {"command": "ls"}}"#;
+        assert!(parse_tool_calls(text, &empty).is_empty());
+        assert_eq!(strip_tool_calls_with(text, &empty), text);
+    }
+
+    /// 多個裸 JSON tool_call 連寫 + 中間夾文字：tool 部分被認出並剝除，文字保留。
+    #[test]
+    fn mixed_text_and_naked_tool_calls() {
+        let reg = registry_with(&[("Bash", "Bash")]);
+        let text = r#"先說明一下{"name": "Bash", "arguments": {"command": "ls"}}然後{"name": "Bash", "arguments": {"command": "pwd"}}結束"#;
+        let calls = parse_tool_calls(text, &reg);
+        assert_eq!(calls.len(), 2, "兩個裸 tool_call 都該抓到: {calls:?}");
+        assert_eq!(calls[0].arguments["command"], "ls");
+        assert_eq!(calls[1].arguments["command"], "pwd");
+        let stripped = strip_tool_calls_with(text, &reg);
+        // 文字部分留下，JSON 部分被剝除
+        assert!(stripped.contains("先說明一下"));
+        assert!(stripped.contains("然後"));
+        assert!(stripped.contains("結束"));
+        assert!(!stripped.contains("\"name\""));
+    }
+
+    /// 有 <tool_call> 區塊時，裸 JSON 偵測不啟用（區塊優先，避免重複/衝突）。
+    #[test]
+    fn tool_call_block_takes_priority_over_naked_detection() {
+        let reg = registry_with(&[("Bash", "Bash")]);
+        let text = r#"<tool_call>{"name":"Bash","arguments":{"command":"ls"}}</tool_call> 另外 {"name":"Bash","arguments":{"command":"pwd"}}"#;
+        let calls = parse_tool_calls(text, &reg);
+        // 只抓到區塊內那個；外面的裸 JSON 雖然 name 也對，但有區塊就走區塊路徑
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["command"], "ls");
     }
 }
