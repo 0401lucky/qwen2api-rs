@@ -131,6 +131,15 @@ pub fn extract_upstream_error(text: &str) -> Option<String> {
     None
 }
 
+/// delta 是否含「有意義」的內容（content / reasoning 任一非空）。
+/// 用於 executor 偵測「空回覆」並觸發跨帳號重試——上游偶發回完整 SSE 但 0 字內容，
+/// 對 client 看起來就是任務莫名停下。
+pub fn delta_has_meaningful_content(d: &QwenDelta) -> bool {
+    !d.content.is_empty()
+        || !d.reasoning_incremental.is_empty()
+        || d.reasoning_cumulative.as_deref().map_or(false, |s| !s.is_empty())
+}
+
 fn format_upstream_error(obj: &Value) -> Option<String> {
     let request_id = obj
         .get("request_id")
@@ -303,6 +312,30 @@ mod tests {
         let err = extract_upstream_error(s).expect("應偵測到錯誤");
         assert!(err.contains("auth_error"));
         assert!(err.contains("invalid token"));
+    }
+
+    /// delta_has_meaningful_content：判斷一筆 delta 是否含 content/reasoning 任一非空。
+    /// 用於空回覆重試判定（executor 不能把完全空的 delta 序列當 success）。
+    #[test]
+    fn meaningful_content_detection() {
+        let empty = QwenDelta::default();
+        assert!(!delta_has_meaningful_content(&empty), "空 delta 應為 false");
+
+        let only_phase = QwenDelta { phase: "answer".into(), ..Default::default() };
+        assert!(!delta_has_meaningful_content(&only_phase), "只有 phase 沒文字應為 false");
+
+        let with_content = QwenDelta { content: "hi".into(), ..Default::default() };
+        assert!(delta_has_meaningful_content(&with_content));
+
+        let with_inc_reasoning = QwenDelta { reasoning_incremental: "thinking".into(), ..Default::default() };
+        assert!(delta_has_meaningful_content(&with_inc_reasoning));
+
+        let with_cumul_reasoning = QwenDelta { reasoning_cumulative: Some("acc".into()), ..Default::default() };
+        assert!(delta_has_meaningful_content(&with_cumul_reasoning));
+
+        // cumulative=Some("") 也應視為空（防止上游送 "" 仍被誤判為有內容）
+        let empty_cumul = QwenDelta { reasoning_cumulative: Some("".into()), ..Default::default() };
+        assert!(!delta_has_meaningful_content(&empty_cumul));
     }
 
     /// 正常 SSE chunk 與 [DONE] 都不會被誤判為錯誤。
