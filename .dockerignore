@@ -1,0 +1,10 @@
+target
+data
+.env
+.git
+*.log
+.playwright-mcp
+dev/captures
+*.png
+*.jpeg
+README.md

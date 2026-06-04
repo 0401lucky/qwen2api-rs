@@ -1,0 +1,7 @@
+/target
+/data
+.env
+*.log
+.playwright-mcp/
+*.png
+/tmp
