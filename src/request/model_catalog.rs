@@ -57,13 +57,23 @@ pub fn build_openai_model_list(upstream: &[Value]) -> Vec<Value> {
 
         let cb = |k: &str| caps.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
         if cb("thinking") {
-            out.push(variant(&id, "-thinking", "thinking", created, &caps, &family));
+            out.push(variant(&id, "-thinking", "thinking", created, &json!({"thinking": true}), &family));
+        }
+        out.push(variant(&id, "-search", "search", created, &json!({"search": true}), &family));
+        if cb("deep_research") {
+            out.push(variant(&id, "-deep-research", "deep_research", created, &json!({"deep_research": true, "search": true}), &family));
         }
         if cb("image_gen") {
-            out.push(variant(&id, "-image", "image", created, &caps, &family));
+            out.push(variant(&id, "-image", "image", created, &json!({"image_gen": true}), &family));
         }
         if cb("video_gen") {
-            out.push(variant(&id, "-video", "video", created, &caps, &family));
+            out.push(variant(&id, "-video", "video", created, &json!({"video_gen": true}), &family));
+        }
+        if cb("web_dev") {
+            out.push(variant(&id, "-webdev", "web_dev", created, &json!({"web_dev": true}), &family));
+        }
+        if cb("slides") {
+            out.push(variant(&id, "-slides", "slides", created, &json!({"slides": true}), &family));
         }
     }
     out
@@ -79,11 +89,17 @@ fn variant(base: &str, suffix: &str, mode: &str, created: i64, caps: &Value, fam
 /// 無法取得上游時的 fallback。
 pub fn fallback_model_list(default_model: &str) -> Vec<Value> {
     let created = now_unix();
-    vec![json!({
+    vec![
+        json!({
         "id": default_model, "object": "model", "created": created, "owned_by": "qwen",
         "base_model": default_model,
         "family": default_model.split('-').next().unwrap_or(default_model),
         "mode": "chat",
         "capabilities": {"thinking": true, "search": true, "vision": true, "image_gen": true, "video_gen": true},
-    })]
+        }),
+        variant(default_model, "-thinking", "thinking", created, &json!({"thinking": true}), default_model.split('-').next().unwrap_or(default_model)),
+        variant(default_model, "-search", "search", created, &json!({"search": true}), default_model.split('-').next().unwrap_or(default_model)),
+        variant(default_model, "-image", "image", created, &json!({"image_gen": true}), default_model.split('-').next().unwrap_or(default_model)),
+        variant(default_model, "-video", "video", created, &json!({"video_gen": true}), default_model.split('-').next().unwrap_or(default_model)),
+    ]
 }

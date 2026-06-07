@@ -177,11 +177,25 @@ pub struct AccountPool {
 
 impl AccountPool {
     pub async fn load(settings: &Settings) -> Arc<Self> {
-        let mut accounts: Vec<Account> =
+        let mut file_accounts: Vec<Account> =
             crate::db::read_json_or(&settings.accounts_file, Vec::new()).await;
-        for a in accounts.iter_mut() {
+        for a in file_accounts.iter_mut() {
             a.init_runtime();
         }
+        let mut env_accounts: Vec<Account> = crate::config::load_env_accounts()
+            .into_iter()
+            .map(|spec| {
+                let mut acc = Account::new(spec.email, spec.password, spec.token, String::new(), String::new());
+                acc.source = "env".to_string();
+                acc.env_name = spec.env_name;
+                acc.init_runtime();
+                acc
+            })
+            .collect();
+        let env_emails: HashSet<String> = env_accounts.iter().map(|a| a.email.clone()).collect();
+        let mut accounts = Vec::with_capacity(env_accounts.len() + file_accounts.len());
+        accounts.append(&mut env_accounts);
+        accounts.extend(file_accounts.into_iter().filter(|a| !env_emails.contains(&a.email)));
         let use_index = settings.pool_ready_index;
         let pool = AccountPool {
             state: Mutex::new(PoolState {
@@ -216,8 +230,9 @@ impl AccountPool {
         }
         let arc = Arc::new(pool);
         tracing::info!(
-            "帳號池已載入 {} 個帳號（Ready-Set 索引: {}）",
+            "帳號池已載入 {} 個帳號（环境注入 {} 个；Ready-Set 索引: {}）",
             arc.count().await,
+            env_emails.len(),
             if use_index { "開" } else { "關" }
         );
         arc
@@ -271,7 +286,8 @@ impl AccountPool {
     }
 
     async fn persist(&self, accounts: &[Account]) {
-        write_json_atomic(&self.accounts_file, &accounts.to_vec()).await;
+        let file_accounts: Vec<Account> = accounts.iter().filter(|a| a.source != "env").cloned().collect();
+        write_json_atomic(&self.accounts_file, &file_accounts).await;
     }
 
     pub async fn save(&self) {

@@ -351,8 +351,16 @@ pub async fn activate_account(State(state): State<AppState>, headers: HeaderMap,
 
 pub async fn get_keys(State(state): State<AppState>, headers: HeaderMap) -> Response {
     admin_guard!(state, headers);
-    let keys: Vec<String> = state.api_keys.read().await.iter().cloned().collect();
-    Json(json!({ "keys": keys })).into_response()
+    let mut keys: Vec<String> = state.api_keys.read().await.iter().cloned().collect();
+    keys.sort();
+    let items: Vec<Value> = keys
+        .iter()
+        .map(|key| {
+            let source = if state.env_api_keys.contains(key) { "env" } else { "managed" };
+            json!({ "key": key, "source": source })
+        })
+        .collect();
+    Json(json!({ "keys": keys, "items": items })).into_response()
 }
 
 pub async fn create_key(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -368,6 +376,13 @@ pub async fn create_key(State(state): State<AppState>, headers: HeaderMap) -> Re
 
 pub async fn delete_key(State(state): State<AppState>, headers: HeaderMap, Path(key): Path<String>) -> Response {
     admin_guard!(state, headers);
+    if state.env_api_keys.contains(&key) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({ "ok": false, "error": "环境变量注入的 Key 不能在运行时删除" })),
+        )
+            .into_response();
+    }
     {
         let mut keys = state.api_keys.write().await;
         keys.remove(&key);
@@ -491,7 +506,7 @@ pub async fn stats_recent(
 // ---- 媒體任務佇列（圖片/影片背景生成 + 本地保存）----
 
 /// POST /api/admin/media/tasks — 提交生成任務（支援單 prompt 或多 prompts 批次）。
-/// body: { kind:"image"|"video", prompt|prompts, ratio, size, n, width, height }
+/// body: { kind:"image"|"video", prompt|prompts, model, ratio, size, n, width, height }
 pub async fn media_submit(State(state): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     admin_guard!(state, headers);
     let data: Value = match serde_json::from_slice(&body) {
@@ -521,6 +536,14 @@ pub async fn media_submit(State(state): State<AppState>, headers: HeaderMap, bod
     }
     // 共用生成參數
     let mut prm = serde_json::Map::new();
+    let model = data
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| crate::media::default_model_id(&state.settings.default_model, kind));
+    prm.insert("model".to_string(), json!(model));
     for k in ["ratio", "aspect_ratio", "size", "width", "height", "n"] {
         if let Some(v) = data.get(k) {
             prm.insert(k.to_string(), v.clone());

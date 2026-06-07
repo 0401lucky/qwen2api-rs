@@ -34,13 +34,21 @@ pub fn normalize_tools(raw: &[Value]) -> Vec<NormalizedTool> {
     for t in raw {
         // OpenAI: {type:"function", function:{name,description,parameters}}
         if let Some(func) = t.get("function") {
-            let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = func
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if name.is_empty() {
                 continue;
             }
             out.push(NormalizedTool {
                 qwen_name: to_qwen_name(&name),
-                description: func.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                description: func
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 parameters: func.get("parameters").cloned().unwrap_or_else(|| json!({})),
                 name,
             });
@@ -53,7 +61,11 @@ pub fn normalize_tools(raw: &[Value]) -> Vec<NormalizedTool> {
             }
             out.push(NormalizedTool {
                 qwen_name: to_qwen_name(name),
-                description: t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                description: t
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 parameters: t
                     .get("input_schema")
                     .or_else(|| t.get("parameters"))
@@ -91,7 +103,9 @@ pub fn build_tool_instruction_block(tools: &[NormalizedTool], _client_profile: &
     let mut s = String::new();
     s.push_str("# 可用工具\n");
     s.push_str("你可以呼叫下列工具。**需要呼叫工具時**，請輸出一個或多個 `<tool_call>` 區塊，格式如下（每個工具一個區塊，內容為合法 JSON）：\n");
-    s.push_str("<tool_call>{\"name\": \"工具名\", \"arguments\": {\"參數\": \"值\"}}</tool_call>\n");
+    s.push_str(
+        "<tool_call>{\"name\": \"工具名\", \"arguments\": {\"參數\": \"值\"}}</tool_call>\n",
+    );
     s.push_str("不要在 <tool_call> 之外解釋你要呼叫工具；若不需要工具則正常自然語言回答。\n\n");
     s.push_str("## 工具列表\n");
     for t in tools {
@@ -99,7 +113,10 @@ pub fn build_tool_instruction_block(tools: &[NormalizedTool], _client_profile: &
         if !t.description.is_empty() {
             s.push_str(&format!("說明: {}\n", t.description));
         }
-        s.push_str(&format!("參數(JSON Schema): {}\n\n", compact_schema(&t.parameters, 700)));
+        s.push_str(&format!(
+            "參數(JSON Schema): {}\n\n",
+            compact_schema(&t.parameters, 700)
+        ));
     }
     s
 }
@@ -247,9 +264,7 @@ pub fn parse_tool_calls(text: &str, registry: &HashMap<String, String>) -> Vec<P
                 Ok(v) => v,
                 Err(_) => continue, // brace 切點落在多 byte 中間（理論上不會）
             };
-            if let Some(c) = parse_one(slice, registry) {
-                calls.push(c);
-            }
+            calls.extend(parse_one(slice, registry));
         }
     }
     // 沒抓到任何 <tool_call> / 圍欄區塊 → 嘗試裸 JSON fallback。
@@ -264,7 +279,10 @@ pub fn parse_tool_calls(text: &str, registry: &HashMap<String, String>) -> Vec<P
 /// 篩選條件（避免把使用者要回的普通 JSON 文字誤判為工具呼叫）：
 /// - 物件有 `name` 字串欄位，且 name 經 norm_key 後在 registry 內
 /// - 物件有 `arguments` / `input` / `parameters` 之一，且為 object 或 string
-fn parse_naked_json_tool_calls(text: &str, registry: &HashMap<String, String>) -> Vec<ParsedToolCall> {
+fn parse_naked_json_tool_calls(
+    text: &str,
+    registry: &HashMap<String, String>,
+) -> Vec<ParsedToolCall> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -272,9 +290,7 @@ fn parse_naked_json_tool_calls(text: &str, registry: &HashMap<String, String>) -
         if bytes[i] == b'{' {
             if let Some(end) = scan_json_object_end(bytes, i) {
                 if let Ok(slice) = std::str::from_utf8(&bytes[i..=end]) {
-                    if let Some(c) = parse_naked_one(slice, registry) {
-                        out.push(c);
-                    }
+                    out.extend(parse_naked_one(slice, registry));
                 }
                 i = end + 1;
                 continue;
@@ -285,52 +301,76 @@ fn parse_naked_json_tool_calls(text: &str, registry: &HashMap<String, String>) -
     out
 }
 
-fn parse_naked_one(json_str: &str, registry: &HashMap<String, String>) -> Option<ParsedToolCall> {
-    let v: Value = serde_json::from_str(json_str).ok()?;
-    let raw_name = v.get("name").and_then(|x| x.as_str())?;
-    // name 必須在 registry 內，這是「裸 JSON」與「普通 JSON 文字」的核心區別
-    if !registry.contains_key(&norm_key(raw_name)) {
-        return None;
+fn parse_naked_one(json_str: &str, registry: &HashMap<String, String>) -> Vec<ParsedToolCall> {
+    let Ok(v) = serde_json::from_str::<Value>(json_str) else {
+        return Vec::new();
+    };
+    if let Some(arr) = v.get("tool_calls").and_then(|x| x.as_array()) {
+        return arr
+            .iter()
+            .filter(|item| looks_like_known_tool_obj(item, registry))
+            .filter_map(|item| parse_obj(item, registry))
+            .collect();
     }
-    // 必須有 arguments-like 欄位且為 object/string，排除 schema 介紹型 JSON
-    let args_ok = ["arguments", "input", "parameters"]
-        .iter()
-        .filter_map(|k| v.get(*k))
-        .any(|f| f.is_object() || f.is_string());
-    if !args_ok {
-        return None;
+    if !looks_like_known_tool_obj(&v, registry) {
+        return Vec::new();
     }
-    parse_obj(&v, registry)
+    parse_obj(&v, registry).into_iter().collect()
 }
 
-fn parse_one(json_str: &str, registry: &HashMap<String, String>) -> Option<ParsedToolCall> {
-    let v: Value = serde_json::from_str(json_str).ok()?;
+fn parse_one(json_str: &str, registry: &HashMap<String, String>) -> Vec<ParsedToolCall> {
+    let Ok(v) = serde_json::from_str::<Value>(json_str) else {
+        return Vec::new();
+    };
     // 兼容 {tool_calls:[...]}
     if let Some(arr) = v.get("tool_calls").and_then(|x| x.as_array()) {
-        // 只取第一個（外層呼叫者會逐個處理；此處簡化）
-        if let Some(first) = arr.first() {
-            return parse_obj(first, registry);
-        }
-        return None;
+        return arr
+            .iter()
+            .filter_map(|item| parse_obj(item, registry))
+            .collect();
     }
-    parse_obj(&v, registry)
+    parse_obj(&v, registry).into_iter().collect()
+}
+
+fn function_payload(v: &Value) -> &Value {
+    v.get("function").filter(|f| f.is_object()).unwrap_or(v)
+}
+
+fn raw_tool_name(v: &Value) -> Option<&str> {
+    let f = function_payload(v);
+    f.get("name")
+        .or_else(|| v.get("tool"))
+        .and_then(|x| x.as_str())
+}
+
+fn raw_tool_args(v: &Value) -> Option<Value> {
+    let f = function_payload(v);
+    f.get("arguments")
+        .or_else(|| f.get("input"))
+        .or_else(|| f.get("parameters"))
+        .or_else(|| f.get("args"))
+        .cloned()
+}
+
+fn looks_like_known_tool_obj(v: &Value, registry: &HashMap<String, String>) -> bool {
+    let Some(raw_name) = raw_tool_name(v) else {
+        return false;
+    };
+    if !registry.contains_key(&norm_key(raw_name)) {
+        return false;
+    }
+    raw_tool_args(v)
+        .map(|args| args.is_object() || args.is_string())
+        .unwrap_or(false)
 }
 
 fn parse_obj(v: &Value, registry: &HashMap<String, String>) -> Option<ParsedToolCall> {
-    let raw_name = v
-        .get("name")
-        .or_else(|| v.get("tool"))
-        .and_then(|x| x.as_str())?;
+    let raw_name = raw_tool_name(v)?;
     let canonical = registry
         .get(&norm_key(raw_name))
         .cloned()
         .unwrap_or_else(|| raw_name.to_string());
-    let arguments = v
-        .get("arguments")
-        .or_else(|| v.get("input"))
-        .or_else(|| v.get("parameters"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let arguments = raw_tool_args(v).unwrap_or_else(|| json!({}));
     // arguments 可能是 JSON 字串
     let arguments = match arguments {
         Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::String(s)),
@@ -368,7 +408,7 @@ pub fn strip_tool_calls_with(text: &str, registry: &HashMap<String, String>) -> 
             if bytes[i] == b'{' {
                 if let Some(end) = scan_json_object_end(bytes, i) {
                     if let Ok(slice) = std::str::from_utf8(&bytes[i..=end]) {
-                        if parse_naked_one(slice, registry).is_some() {
+                        if !parse_naked_one(slice, registry).is_empty() {
                             ranges.push((i, end + 1));
                         }
                     }
@@ -428,7 +468,10 @@ mod tests {
         let calls = parse_tool_calls(text, &reg);
         assert_eq!(calls.len(), 1, "巢狀 {{}} 不該破壞解析: {calls:?}");
         assert_eq!(calls[0].name, "Bash");
-        assert_eq!(calls[0].arguments["command"], r#"jq -r '{a: 1, b: {c: 2}}'"#);
+        assert_eq!(
+            calls[0].arguments["command"],
+            r#"jq -r '{a: 1, b: {c: 2}}'"#
+        );
         // strip 後應該整段被剝光（區塊外無其他文字）
         assert_eq!(strip_tool_calls(text), "");
     }
@@ -485,7 +528,10 @@ some text
         assert_eq!(calls.len(), 1, "圍欄區塊應正確解析: {calls:?}");
         assert_eq!(calls[0].arguments["command"], "jq '{x:1}'");
         // strip 應把圍欄整段剝光
-        assert!(strip_tool_calls(text).trim().is_empty(), "圍欄區塊應被 strip 乾淨");
+        assert!(
+            strip_tool_calls(text).trim().is_empty(),
+            "圍欄區塊應被 strip 乾淨"
+        );
     }
 
     /// 純自然語言（無 tool 標記）→ parse 空、strip 不動。
@@ -558,7 +604,10 @@ some text
     fn naked_json_without_args_field_passes_through() {
         let reg = registry_with(&[("Bash", "Bash")]);
         let text = r#"{"name": "Bash", "description": "Executes shell commands"}"#;
-        assert!(parse_tool_calls(text, &reg).is_empty(), "缺 arguments 該視為文字");
+        assert!(
+            parse_tool_calls(text, &reg).is_empty(),
+            "缺 arguments 該視為文字"
+        );
         assert_eq!(strip_tool_calls_with(text, &reg), text);
     }
 
@@ -597,5 +646,38 @@ some text
         // 只抓到區塊內那個；外面的裸 JSON 雖然 name 也對，但有區塊就走區塊路徑
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["command"], "ls");
+    }
+
+    /// OpenAI 常見形狀：tool_calls 陣列可一次包含多個 function tool call。
+    #[test]
+    fn openai_tool_calls_array_parses_all_function_items() {
+        let reg = registry_with(&[("Bash", "Bash"), ("Read", "Read")]);
+        let text = r#"<tool_call>{"tool_calls":[
+            {"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"ls\"}"}},
+            {"id":"call_2","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"README.md\"}"}}
+        ]}</tool_call>"#;
+        let calls = parse_tool_calls(text, &reg);
+        assert_eq!(calls.len(), 2, "tool_calls 陣列不應只取第一個: {calls:?}");
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].arguments["command"], "ls");
+        assert_eq!(calls[1].name, "Read");
+        assert_eq!(calls[1].arguments["file_path"], "README.md");
+    }
+
+    /// thinking 模型偶發裸吐 OpenAI tool_calls 物件；registry 命中時要當工具並剝除。
+    #[test]
+    fn naked_openai_tool_calls_array_parses_and_strips() {
+        let reg = registry_with(&[("shell_run", "Bash"), ("fs_open_file", "Read")]);
+        let text = r#"{"tool_calls":[
+            {"function":{"name":"shell_run","arguments":"{\"command\":\"pwd\"}"}},
+            {"function":{"name":"fs_open_file","arguments":"{\"file_path\":\"src/main.rs\"}"}}
+        ]}"#;
+        let calls = parse_tool_calls(text, &reg);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "Bash");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+        assert_eq!(calls[1].name, "Read");
+        assert_eq!(calls[1].arguments["file_path"], "src/main.rs");
+        assert!(strip_tool_calls_with(text, &reg).trim().is_empty());
     }
 }

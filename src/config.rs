@@ -2,7 +2,7 @@
 //! 從環境變數 / `.env` 讀取，並提供 MODEL_MAP 模型別名映射。
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 
@@ -12,6 +12,82 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 
 fn env_str(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+#[derive(Debug, Clone)]
+pub struct EnvAccountSpec {
+    pub email: String,
+    pub password: String,
+    pub token: String,
+    pub env_name: String,
+}
+
+fn split_list_values(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+}
+
+fn numbered_env_values(prefix: &str) -> Vec<(usize, String, String)> {
+    let mut values = Vec::new();
+    for (name, value) in env::vars() {
+        let Some(raw_index) = name.strip_prefix(prefix) else { continue };
+        let Ok(index) = raw_index.parse::<usize>() else { continue };
+        values.push((index, name, value));
+    }
+    values.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    values
+}
+
+fn dedupe_nonempty(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let item = value.trim().to_string();
+        if item.is_empty() || !seen.insert(item.clone()) {
+            continue;
+        }
+        out.push(item);
+    }
+    out
+}
+
+/// 从环境变量注入下游 API Key。
+pub fn load_env_api_keys() -> Vec<String> {
+    let mut values = Vec::new();
+    for name in ["QWEN_API_KEY", "QWEN_API_KEYS", "API_KEYS"] {
+        if let Ok(raw) = env::var(name) {
+            values.extend(split_list_values(&raw));
+        }
+    }
+    for (_, _, raw) in numbered_env_values("QWEN_API_KEY_") {
+        values.extend(split_list_values(&raw));
+    }
+    dedupe_nonempty(values)
+}
+
+/// 从 QWEN_ACCOUNT_1 / QWEN_ACCOUNT_2 ... 注入上游账号。
+/// 格式：token;email;password，其中 email/password 可省略。
+pub fn load_env_accounts() -> Vec<EnvAccountSpec> {
+    let mut out = Vec::new();
+    for (index, name, raw) in numbered_env_values("QWEN_ACCOUNT_") {
+        let mut parts = raw.splitn(3, ';');
+        let token = parts.next().unwrap_or("").trim().to_string();
+        if token.is_empty() {
+            continue;
+        }
+        let email = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("env_{index}@qwen"));
+        let password = parts.next().unwrap_or("").trim().to_string();
+        out.push(EnvAccountSpec { email, password, token, env_name: name });
+    }
+    out
 }
 
 /// 執行期設定。部分欄位（並發/預熱池）可在管理台運行時調整，故用內部可變的 AppState 持有副本。

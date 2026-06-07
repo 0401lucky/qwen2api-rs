@@ -136,7 +136,7 @@ pub async fn build_gemini_request(
         stream,
         thinking_enabled: if mode.force_thinking { Some(true) } else { None },
         force_thinking: mode.force_thinking,
-        enable_search: mode.chat_type == "deep_research",
+        enable_search: mode.chat_type == "deep_research" || mode.mode == "search",
         chat_type: mode.chat_type,
         tools: built.tools,
         tool_names: built.tool_names,
@@ -179,7 +179,7 @@ pub async fn build_openai_request(
 
     let (thinking_enabled, _forced) = extract_thinking(body, mode.force_thinking);
     let enable_search =
-        mode.chat_type == "deep_research" || coerce_bool(body.get("enable_search")).unwrap_or(false);
+        mode.chat_type == "deep_research" || mode.mode == "search" || coerce_bool(body.get("enable_search")).unwrap_or(false);
     let stream = coerce_bool(body.get("stream")).unwrap_or(false);
     let max_tokens = body
         .get("max_tokens")

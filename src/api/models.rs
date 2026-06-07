@@ -56,6 +56,16 @@ pub async fn list_models(
 pub async fn get_model(State(state): State<AppState>, Path(model_id): Path<String>) -> Response {
     let mode = parse_model_mode(&model_id);
     let _ = state; // 預留：未來可查上游能力
+    let capabilities = json!({
+        "thinking": mode.force_thinking || mode.mode == "thinking",
+        "search": mode.mode == "search" || mode.mode == "deep_research",
+        "deep_research": mode.mode == "deep_research",
+        "vision": true,
+        "image_gen": mode.mode == "image",
+        "video_gen": mode.mode == "video",
+        "web_dev": mode.mode == "web_dev",
+        "slides": mode.mode == "slides",
+    });
     Json(json!({
         "id": model_id,
         "object": "model",
@@ -63,7 +73,7 @@ pub async fn get_model(State(state): State<AppState>, Path(model_id): Path<Strin
         "owned_by": "qwen",
         "base_model": mode.base_model,
         "mode": mode.mode,
-        "capabilities": { "thinking": mode.force_thinking || mode.mode == "thinking", "search": true, "vision": true },
+        "capabilities": capabilities,
     }))
     .into_response()
 }

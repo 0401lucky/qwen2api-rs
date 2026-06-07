@@ -8,6 +8,14 @@ fn default_valid() -> bool {
     true
 }
 
+fn default_source() -> String {
+    "file".to_string()
+}
+
+fn is_default_source(source: &str) -> bool {
+    source == "file"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub email: String,
@@ -19,6 +27,10 @@ pub struct Account {
     pub cookies: String,
     #[serde(default)]
     pub username: String,
+    #[serde(default = "default_source", skip_serializing_if = "is_default_source")]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub env_name: String,
 
     #[serde(default)]
     pub activation_pending: bool,
@@ -62,6 +74,8 @@ impl Account {
             token,
             cookies,
             username,
+            source: default_source(),
+            env_name: String::new(),
             activation_pending,
             status_code: if activation_pending { "pending_activation" } else { "valid" }.to_string(),
             last_error: String::new(),
@@ -145,6 +159,8 @@ impl Account {
         serde_json::json!({
             "email": self.email,
             "username": self.username,
+            "source": self.source,
+            "env_name": self.env_name,
             "valid": self.valid,
             "inflight": self.inflight,
             "rate_limited_until": self.rate_limited_until,

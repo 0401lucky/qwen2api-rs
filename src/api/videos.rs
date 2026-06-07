@@ -40,12 +40,23 @@ pub async fn generate(
         .and_then(|v| v.as_str())
         .unwrap_or("16:9")
         .to_string();
+    let size = body.get("size").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let width = body.get("width").and_then(|v| v.as_i64());
+    let height = body.get("height").and_then(|v| v.as_i64());
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| media::default_model_id(&state.settings.default_model, MediaKind::Video));
 
-    let options = ImageOptions { size: None, ratio: Some(ratio.clone()), width: None, height: None };
+    let options = ImageOptions { size: size.clone(), ratio: Some(ratio.clone()), width, height };
     let out = media::generate_with_retry(
         &state,
         &prompt,
         MediaKind::Video,
+        &model,
         options,
         state.settings.media_max_attempts,
         caller.clone(),
@@ -60,18 +71,42 @@ pub async fn generate(
     }
 
     // 背景：下載本地備份 + 記錄到媒體庫（API 回應不等待，仍回 CDN URL）
-    spawn_backup(state.clone(), out.urls.clone(), prompt.clone(), ratio.clone(), caller);
+    spawn_backup(state.clone(), out.urls.clone(), prompt.clone(), model.clone(), ratio.clone(), size.clone(), width, height, caller);
 
-    let data: Vec<Value> = out.urls.into_iter().map(|u| json!({ "url": u, "revised_prompt": "", "ratio": ratio })).collect();
+    let data: Vec<Value> = out
+        .urls
+        .into_iter()
+        .map(|u| {
+            json!({
+                "url": u,
+                "revised_prompt": "",
+                "ratio": ratio,
+                "size": size,
+                "width": width,
+                "height": height,
+                "model": model,
+            })
+        })
+        .collect();
     Json(json!({ "created": now_unix(), "data": data })).into_response()
 }
 
 /// fire-and-forget：下載 CDN 影片到本地並在媒體庫記一筆 done（供畫廊與防丟失）。
-fn spawn_backup(state: AppState, urls: Vec<String>, prompt: String, ratio: String, caller: Option<String>) {
+fn spawn_backup(
+    state: AppState,
+    urls: Vec<String>,
+    prompt: String,
+    model: String,
+    ratio: String,
+    size: Option<String>,
+    width: Option<i64>,
+    height: Option<i64>,
+    caller: Option<String>,
+) {
     tokio::spawn(async move {
         let client = state.client.client();
         let results = state.media_queue.store.backup_urls(&client, &urls, MediaKind::Video).await;
-        let params = json!({ "ratio": ratio });
+        let params = json!({ "model": model, "ratio": ratio, "size": size, "width": width, "height": height });
         state
             .media_queue
             .store

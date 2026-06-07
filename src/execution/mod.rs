@@ -4,6 +4,7 @@
 pub mod formatters;
 pub mod presenter;
 pub mod translator;
+pub mod visible_text;
 
 use crate::request::StandardRequest;
 use crate::state::AppState;
@@ -19,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tiktoken_rs::CoreBPE;
+use visible_text::{sanitize_visible_text, VisibleTextSanitizer};
 
 static BPE: Lazy<CoreBPE> = Lazy::new(|| tiktoken_rs::cl100k_base().expect("cl100k_base"));
 
@@ -208,6 +210,8 @@ pub fn run_completion(
         let mut probe = StatsProbe::new(stats, probe_meta);
         let mut upstream = Box::pin(executor.clone().run_stream(params));
         let mut tracker = ReasoningTracker::new();
+        let mut reasoning_sanitizer = VisibleTextSanitizer::new();
+        let mut content_sanitizer = VisibleTextSanitizer::new();
         let mut answer_buf = String::new();
         let mut streamed_content = false; // 無工具時逐步串流
         let mut last_out_tokens = 0i64;
@@ -236,8 +240,11 @@ pub fn run_completion(
                     // reasoning（增量）
                     let rinc = tracker.delta(&d.reasoning_cumulative, &d.reasoning_incremental);
                     if !rinc.is_empty() {
-                        probe.mark_first_token();
-                        yield OutEvent::ReasoningDelta(rinc);
+                        let visible_reasoning = reasoning_sanitizer.feed(&rinc);
+                        if !visible_reasoning.is_empty() {
+                            probe.mark_first_token();
+                            yield OutEvent::ReasoningDelta(visible_reasoning);
+                        }
                     }
                     // content：收集所有非思考階段（answer / image_gen / t2v 影片 URL 等）
                     if !d.content.is_empty() {
@@ -245,8 +252,11 @@ pub fn run_completion(
                             probe.mark_first_token();
                             answer_buf.push_str(&d.content);
                             if !has_tools {
-                                yield OutEvent::ContentDelta(d.content.clone());
-                                streamed_content = true;
+                                let visible_content = content_sanitizer.feed(&d.content);
+                                if !visible_content.is_empty() {
+                                    yield OutEvent::ContentDelta(visible_content);
+                                    streamed_content = true;
+                                }
                             }
                         } else {
                             skipped_phase_content_chars += d.content.chars().count();
@@ -273,6 +283,8 @@ pub fn run_completion(
                     answer_buf.clear();
                     streamed_content = false;
                     tracker = ReasoningTracker::new();
+                    reasoning_sanitizer.reset();
+                    content_sanitizer.reset();
                     last_out_tokens = 0;
                     last_reasoning_tokens = 0;
                     phase_counts.clear();
@@ -296,6 +308,7 @@ pub fn run_completion(
         let mut yielded_content_at_end = false;
         if has_tools && !streamed_content {
             let cleaned = strip_tool_calls_with(&answer_buf, &registry);
+            let cleaned = sanitize_visible_text(cleaned.trim());
             let cleaned = cleaned.trim();
             if !cleaned.is_empty() {
                 yield OutEvent::ContentDelta(cleaned.to_string());
@@ -314,8 +327,23 @@ pub fn run_completion(
         if has_tools && !streamed_content && !yielded_content_at_end && tool_calls.is_empty()
             && !answer_buf.trim().is_empty()
         {
-            yield OutEvent::ContentDelta(answer_buf.clone());
-            yielded_content_at_end = true;
+            let visible = sanitize_visible_text(&answer_buf);
+            if !visible.trim().is_empty() {
+                yield OutEvent::ContentDelta(visible);
+                yielded_content_at_end = true;
+            }
+        }
+
+        let reasoning_tail = reasoning_sanitizer.flush();
+        if !reasoning_tail.is_empty() {
+            yield OutEvent::ReasoningDelta(reasoning_tail);
+        }
+        if !has_tools {
+            let content_tail = content_sanitizer.flush();
+            if !content_tail.is_empty() {
+                yield OutEvent::ContentDelta(content_tail);
+                streamed_content = true;
+            }
         }
 
         // 診斷：thinking 模型偶發「思考完客戶端啥都沒看到」/「看到空 block + Brewed 等待」。
@@ -357,6 +385,7 @@ pub fn run_completion(
 
         // usage：completion 用上游 output_tokens（最準），prompt 用本地 tiktoken
         let visible = if has_tools { strip_tool_calls_with(&answer_buf, &registry) } else { answer_buf.clone() };
+        let visible = sanitize_visible_text(&visible);
         let prompt_tokens = count_tokens(&prompt) as i64;
         let completion_tokens = if last_out_tokens > 0 { last_out_tokens } else { char_len(&visible) as i64 };
         let usage = Usage {

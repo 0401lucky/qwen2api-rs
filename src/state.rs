@@ -30,6 +30,8 @@ pub struct AppStateInner {
     pub executor: Arc<Executor>,
     pub users_db: JsonDb<Vec<User>>,
     pub api_keys: RwLock<HashSet<String>>,
+    /// 由环境变量注入的 API Key；运行时生效，但保存时不写入 api_keys.json。
+    pub env_api_keys: HashSet<String>,
     pub file_store: Arc<crate::context::file_store::FileStore>,
     /// 請求統計子系統（背景批次寫入 SQLite）。
     pub stats: Arc<crate::stats::Stats>,
@@ -83,7 +85,9 @@ impl AppStateInner {
         // 載入 api_keys.json
         let keys_file: ApiKeysFile =
             crate::db::read_json_or(&settings.api_keys_file, ApiKeysFile::default()).await;
-        let api_keys: HashSet<String> = keys_file.keys.into_iter().collect();
+        let env_api_keys: HashSet<String> = crate::config::load_env_api_keys().into_iter().collect();
+        let mut api_keys: HashSet<String> = keys_file.keys.into_iter().collect();
+        api_keys.extend(env_api_keys.iter().cloned());
 
         let stats = crate::stats::Stats::new(&settings.stats_file);
 
@@ -105,6 +109,7 @@ impl AppStateInner {
             media_queue,
             no_t2v,
             api_keys: RwLock::new(api_keys),
+            env_api_keys,
             upstream_models: RwLock::new(UpstreamModelsCache::default()),
             runtime_cfg,
             settings,
@@ -113,7 +118,14 @@ impl AppStateInner {
 
     /// 持久化 api_keys 到磁碟。
     pub async fn save_api_keys(&self) {
-        let keys: Vec<String> = self.api_keys.read().await.iter().cloned().collect();
+        let keys: Vec<String> = self
+            .api_keys
+            .read()
+            .await
+            .iter()
+            .filter(|k| !self.env_api_keys.contains(*k))
+            .cloned()
+            .collect();
         write_json_atomic(&self.api_keys_file, &ApiKeysFile { keys }).await;
     }
 

@@ -8,6 +8,7 @@
 //!
 //! 對外 API（/v1/images、/v1/videos）仍回 Qwen CDN 原始 URL，僅「額外」存本地備份（使用者決策）。
 
+use crate::request::model_modes::parse_model_mode;
 use crate::request::StandardRequest;
 use crate::state::AppState;
 use crate::upstream::ImageOptions;
@@ -44,6 +45,12 @@ impl MediaKind {
             MediaKind::Video => "videos",
         }
     }
+    fn model_suffix(&self) -> &'static str {
+        match self {
+            MediaKind::Image => "-image",
+            MediaKind::Video => "-video",
+        }
+    }
     pub fn parse(s: &str) -> MediaKind {
         if s.eq_ignore_ascii_case("video") || s == "t2v" {
             MediaKind::Video
@@ -57,6 +64,44 @@ impl MediaKind {
             MediaKind::Video => "mp4",
         }
     }
+}
+
+/// 媒體頁/API 未顯式指定模型時使用的預設變體 ID。
+pub fn default_model_id(default_model: &str, kind: MediaKind) -> String {
+    let base = parse_model_mode(default_model).base_model;
+    format!("{base}{}", kind.model_suffix())
+}
+
+fn alias_media_model(requested: &str, kind: MediaKind, default_model: &str) -> String {
+    let trimmed = requested.trim();
+    if trimmed.is_empty() {
+        return default_model_id(default_model, kind);
+    }
+    let default_base = parse_model_mode(default_model).base_model;
+    match (kind, trimmed.to_lowercase().as_str()) {
+        (MediaKind::Image, "dall-e-3")
+        | (MediaKind::Image, "dall-e-2")
+        | (MediaKind::Image, "qwen-image")
+        | (MediaKind::Image, "qwen-image-plus")
+        | (MediaKind::Image, "qwen-image-turbo") => default_base,
+        (MediaKind::Video, "qwen-video")
+        | (MediaKind::Video, "qwen-video-plus")
+        | (MediaKind::Video, "qwen-video-turbo") => default_base,
+        _ => trimmed.to_string(),
+    }
+}
+
+/// 將前端/API 傳入的媒體模型變體解析成「回應/統計模型 ID」與「上游 base model」。
+pub async fn resolve_media_model(state: &AppState, requested: Option<&str>, kind: MediaKind) -> (String, String) {
+    let response_model = requested
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| default_model_id(&state.settings.default_model, kind));
+    let aliased = alias_media_model(&response_model, kind, &state.settings.default_model);
+    let mode = parse_model_mode(&aliased);
+    let resolved = state.resolve_model(&mode.base_model).await;
+    (response_model, resolved)
 }
 
 /// 從上游回應文字抓圖片/影片 URL（合併原 images.rs / videos.rs 的抓取邏輯）。
@@ -109,15 +154,12 @@ pub async fn generate_with_retry(
     state: &AppState,
     prompt: &str,
     kind: MediaKind,
+    model: &str,
     options: ImageOptions,
     max_attempts: u32,
     caller: Option<String>,
 ) -> GenOutcome {
-    let resolved = state.resolve_model(&state.settings.default_model).await;
-    let response_model = match kind {
-        MediaKind::Image => "qwen-image",
-        MediaKind::Video => "qwen-video",
-    };
+    let (response_model, resolved) = resolve_media_model(state, Some(model), kind).await;
     let attempts = max_attempts.max(1);
     let mut last_error: Option<String> = None;
 
@@ -603,6 +645,13 @@ async fn process_task(state: AppState, store: Arc<MediaStore>, id: i64, attempts
     let kind = MediaKind::parse(&task.kind);
     let prm: Value = serde_json::from_str(&task.params).unwrap_or(Value::Null);
     let options = params_to_image_options(&prm, kind);
+    let model = prm
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| default_model_id(&state.settings.default_model, kind));
     // 圖片支援 n 張；影片固定 1。
     let n = if kind == MediaKind::Image {
         prm.get("n").and_then(|v| v.as_u64()).unwrap_or(1).clamp(1, 4) as u32
@@ -616,7 +665,7 @@ async fn process_task(state: AppState, store: Arc<MediaStore>, id: i64, attempts
     let mut last_err: Option<String> = None;
 
     for _ in 0..n {
-        let out = generate_with_retry(&state, &task.prompt, kind, options.clone(), attempts, task.caller.clone()).await;
+        let out = generate_with_retry(&state, &task.prompt, kind, &model, options.clone(), attempts, task.caller.clone()).await;
         total_attempts += out.attempts;
         if out.urls.is_empty() {
             last_err = out.error;

@@ -674,6 +674,13 @@ tbody tr:hover { background: rgba(255,255,255,0.02); }
 }
 .task-time { margin-left: auto; }
 .task-meta { color: var(--fg-dim); }
+.task-model {
+  color: var(--fg-dim);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .task-media { display: flex; flex-direction: column; gap: 8px; }
 .media-cell {
   background: var(--bg-1);

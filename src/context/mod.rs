@@ -4,9 +4,11 @@
 pub mod file_store;
 pub mod oss;
 
+use crate::account::AccountHandle;
 use crate::state::AppState;
 use base64::Engine;
 use serde_json::Value;
+use std::collections::HashSet;
 
 /// 附件預處理結果。
 #[derive(Debug, Default)]
@@ -16,7 +18,7 @@ pub struct AttachmentResult {
     /// 內聯到 prompt 的文字（小文字檔）。
     pub inline_note: String,
     /// 綁定帳號（上傳檔案的帳號，後續對話須用同一帳號）。
-    pub bound_account: Option<String>,
+    pub bound_account: Option<AccountHandle>,
 }
 
 struct RawAttachment {
@@ -29,13 +31,17 @@ fn is_textual(content_type: &str, filename: &str) -> bool {
     if content_type.starts_with("text/") {
         return true;
     }
-    if matches!(content_type, "application/json" | "application/xml" | "application/x-yaml" | "application/javascript") {
+    if matches!(
+        content_type,
+        "application/json" | "application/xml" | "application/x-yaml" | "application/javascript"
+    ) {
         return true;
     }
     let lower = filename.to_lowercase();
     [
-        ".txt", ".md", ".json", ".log", ".xml", ".yaml", ".yml", ".csv", ".html", ".css", ".py", ".js", ".ts",
-        ".java", ".c", ".cpp", ".cs", ".php", ".go", ".rb", ".sh", ".rs", ".toml", ".ini",
+        ".txt", ".md", ".json", ".log", ".xml", ".yaml", ".yml", ".csv", ".html", ".css", ".py",
+        ".js", ".ts", ".java", ".c", ".cpp", ".cs", ".php", ".go", ".rb", ".sh", ".rs", ".toml",
+        ".ini",
     ]
     .iter()
     .any(|e| lower.ends_with(e))
@@ -46,12 +52,21 @@ fn parse_data_uri(url: &str) -> Option<(String, Vec<u8>)> {
     let rest = url.strip_prefix("data:")?;
     let (meta, data) = rest.split_once(',')?;
     if meta.contains(";base64") {
-        let ct = meta.split(';').next().unwrap_or("application/octet-stream").to_string();
-        let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+        let ct = meta
+            .split(';')
+            .next()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .ok()?;
         Some((ct, bytes))
     } else {
         let ct = meta.split(';').next().unwrap_or("text/plain").to_string();
-        Some((ct, urlencoding::decode(data).ok()?.into_owned().into_bytes()))
+        Some((
+            ct,
+            urlencoding::decode(data).ok()?.into_owned().into_bytes(),
+        ))
     }
 }
 
@@ -63,23 +78,46 @@ async fn extract_from_part(state: &AppState, part: &Value) -> Option<RawAttachme
             // 依 file_id 從本地檔案庫取回
             if let Some(fid) = part.get("file_id").and_then(|v| v.as_str()) {
                 if let Some((meta, bytes)) = state.file_store.get(fid).await {
-                    return Some(RawAttachment { filename: meta.filename, content_type: meta.content_type, bytes });
+                    return Some(RawAttachment {
+                        filename: meta.filename,
+                        content_type: meta.content_type,
+                        bytes,
+                    });
                 }
             }
             // 內嵌 data（部分客戶端）
-            if let Some(src) = part.get("file_data").or_else(|| part.get("data")).and_then(|v| v.as_str()) {
+            if let Some(src) = part
+                .get("file_data")
+                .or_else(|| part.get("data"))
+                .and_then(|v| v.as_str())
+            {
                 if let Some((ct, bytes)) = parse_data_uri(src) {
-                    let name = part.get("filename").and_then(|v| v.as_str()).unwrap_or("file").to_string();
-                    return Some(RawAttachment { filename: name, content_type: ct, bytes });
+                    let name = part
+                        .get("filename")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("file")
+                        .to_string();
+                    return Some(RawAttachment {
+                        filename: name,
+                        content_type: ct,
+                        bytes,
+                    });
                 }
             }
             None
         }
         "image_url" => {
-            let url = part.get("image_url").and_then(|u| u.get("url")).and_then(|v| v.as_str())?;
+            let url = part
+                .get("image_url")
+                .and_then(|u| u.get("url"))
+                .and_then(|v| v.as_str())?;
             if url.starts_with("data:") {
                 let (ct, bytes) = parse_data_uri(url)?;
-                Some(RawAttachment { filename: format!("image.{}", ct.rsplit('/').next().unwrap_or("png")), content_type: ct, bytes })
+                Some(RawAttachment {
+                    filename: format!("image.{}", ct.rsplit('/').next().unwrap_or("png")),
+                    content_type: ct,
+                    bytes,
+                })
             } else {
                 None // http URL：留給 prompt 文字保底（prompt_builder 已處理）
             }
@@ -88,10 +126,20 @@ async fn extract_from_part(state: &AppState, part: &Value) -> Option<RawAttachme
         "image" => {
             let src = part.get("source")?;
             if src.get("type").and_then(|v| v.as_str()) == Some("base64") {
-                let mt = src.get("media_type").and_then(|v| v.as_str()).unwrap_or("image/png").to_string();
+                let mt = src
+                    .get("media_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("image/png")
+                    .to_string();
                 let data = src.get("data").and_then(|v| v.as_str())?;
-                let bytes = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
-                return Some(RawAttachment { filename: format!("image.{}", mt.rsplit('/').next().unwrap_or("png")), content_type: mt, bytes });
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .ok()?;
+                return Some(RawAttachment {
+                    filename: format!("image.{}", mt.rsplit('/').next().unwrap_or("png")),
+                    content_type: mt,
+                    bytes,
+                });
             }
             None
         }
@@ -134,7 +182,7 @@ pub async fn prepare_attachments(state: &AppState, body: &Value) -> AttachmentRe
         }
     }
     let account = if need_account {
-        state.pool.any_valid_account().await
+        state.pool.acquire_wait(None, &HashSet::new(), 60.0).await
     } else {
         None
     };
@@ -144,18 +192,19 @@ pub async fn prepare_attachments(state: &AppState, body: &Value) -> AttachmentRe
         if textual {
             if let Ok(text) = String::from_utf8(a.bytes.clone()) {
                 if text.chars().count() <= inline_max {
-                    result
-                        .inline_note
-                        .push_str(&format!("\n\n[附件檔案: {}]\n```\n{}\n```", a.filename, text));
+                    result.inline_note.push_str(&format!(
+                        "\n\n[附件檔案: {}]\n```\n{}\n```",
+                        a.filename, text
+                    ));
                     continue;
                 }
             }
         }
         // 走 OSS 上傳
-        if let Some((email, token)) = &account {
+        if let Some(handle) = &account {
             match oss::upload_file(
                 &state.client.client(),
-                token,
+                &handle.token,
                 &a.filename,
                 &a.bytes,
                 &a.content_type,
@@ -165,13 +214,27 @@ pub async fn prepare_attachments(state: &AppState, body: &Value) -> AttachmentRe
             {
                 Ok(remote_ref) => {
                     result.files.push(remote_ref);
-                    result.bound_account = Some(email.clone());
                 }
                 Err(e) => {
                     tracing::warn!("附件上傳失敗 {}: {e}", a.filename);
-                    result.inline_note.push_str(&format!("\n\n[附件 {} 上傳失敗，已略過]", a.filename));
+                    result
+                        .inline_note
+                        .push_str(&format!("\n\n[附件 {} 上傳失敗，已略過]", a.filename));
                 }
             }
+        } else {
+            result.inline_note.push_str(&format!(
+                "\n\n[附件 {} 需要上傳，但帳號池暫無可用帳號，已略過]",
+                a.filename
+            ));
+        }
+    }
+
+    if let Some(handle) = account {
+        if result.files.is_empty() {
+            state.pool.release(&handle.email).await;
+        } else {
+            result.bound_account = Some(handle);
         }
     }
 

@@ -219,6 +219,7 @@ async fn main() {
         // 探針
         .route("/healthz", get(api::probes::healthz))
         .route("/readyz", get(api::probes::readyz))
+        .route("/keepalive", get(api::probes::keepalive).head(api::probes::keepalive_head))
         .route("/api", get(api::probes::root))
         .nest("/api/admin", admin_router())
         .nest_service("/media", media_service)

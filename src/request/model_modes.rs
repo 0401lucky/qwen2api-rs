@@ -13,6 +13,7 @@ pub struct ModelMode {
 fn suffix_table() -> &'static [(&'static str, &'static str, bool, &'static str)] {
     &[
         ("-thinking", "t2t", true, "thinking"),
+        ("-search", "t2t", false, "search"),
         ("-deep-research", "deep_research", true, "deep_research"),
         ("-deep_research", "deep_research", true, "deep_research"),
         ("-image", "t2i", false, "image"),

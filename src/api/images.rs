@@ -44,6 +44,13 @@ pub async fn generate(
     let size = body.get("size").and_then(|v| v.as_str()).unwrap_or("1024x1024").to_string();
     let width = body.get("width").and_then(|v| v.as_i64());
     let height = body.get("height").and_then(|v| v.as_i64());
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| media::default_model_id(&state.settings.default_model, MediaKind::Image));
 
     let options = ImageOptions {
         size: Some(size.clone()),
@@ -61,6 +68,7 @@ pub async fn generate(
             &state,
             &prompt,
             MediaKind::Image,
+            &model,
             options.clone(),
             state.settings.media_max_attempts,
             caller.clone(),
@@ -79,6 +87,7 @@ pub async fn generate(
                 "size": size,
                 "width": width,
                 "height": height,
+                "model": model,
             }));
         }
     }
@@ -89,16 +98,26 @@ pub async fn generate(
     }
 
     // 背景本地備份 + 記錄媒體庫（API 仍回 CDN URL）
-    spawn_backup(state.clone(), all_urls, prompt.clone(), ratio.clone(), size, caller);
+    spawn_backup(state.clone(), all_urls, prompt.clone(), model.clone(), ratio.clone(), size, width, height, caller);
 
     Json(json!({ "created": now_unix(), "data": data_items })).into_response()
 }
 
-fn spawn_backup(state: AppState, urls: Vec<String>, prompt: String, ratio: String, size: String, caller: Option<String>) {
+fn spawn_backup(
+    state: AppState,
+    urls: Vec<String>,
+    prompt: String,
+    model: String,
+    ratio: String,
+    size: String,
+    width: Option<i64>,
+    height: Option<i64>,
+    caller: Option<String>,
+) {
     tokio::spawn(async move {
         let client = state.client.client();
         let results = state.media_queue.store.backup_urls(&client, &urls, MediaKind::Image).await;
-        let params = json!({ "ratio": ratio, "size": size });
+        let params = json!({ "model": model, "ratio": ratio, "size": size, "width": width, "height": height });
         state
             .media_queue
             .store

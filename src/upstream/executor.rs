@@ -5,7 +5,7 @@ use super::chat_id_pool::ChatIdPool;
 use super::client::QwenClient;
 use super::payload::{build_chat_payload, BuildPayloadArgs, ImageOptions};
 use super::sse::{delta_has_answer_content, extract_upstream_error, parse_sse_chunk, QwenDelta};
-use crate::account::AccountPool;
+use crate::account::{AccountHandle, AccountPool};
 use crate::config::Settings;
 use async_stream::stream;
 use futures_util::Stream;
@@ -16,7 +16,10 @@ use std::sync::Arc;
 /// 執行器輸出的事件。
 #[derive(Debug, Clone)]
 pub enum UpstreamEvent {
-    Meta { chat_id: String, email: String },
+    Meta {
+        chat_id: String,
+        email: String,
+    },
     Delta(QwenDelta),
     Done,
     Error(String),
@@ -36,7 +39,8 @@ pub struct StreamParams {
     pub image_options: Option<ImageOptions>,
     pub thinking_enabled: Option<bool>,
     pub enable_search: bool,
-    pub fixed_account: Option<String>,
+    /// 附件模式下預先從帳號池取得的固定帳號；執行結束時必須 release。
+    pub fixed_account: Option<AccountHandle>,
     pub existing_chat_id: Option<String>,
     pub delete_on_close: bool,
     pub use_prewarmed: bool,
@@ -82,7 +86,7 @@ pub struct Executor {
 struct StreamGuard {
     pool: Arc<AccountPool>,
     client: Arc<QwenClient>,
-    /// Some = 由帳號池取得，需 release；fixed_account 則為 None。
+    /// Some = 由帳號池取得，需 release。
     email: Option<String>,
     token: String,
     /// Some = 本次建立、需刪除的會話。
@@ -106,7 +110,9 @@ impl Drop for StreamGuard {
         // Drop 不能 await → spawn detached 清理任務
         tokio::spawn(async move {
             if let Some(cid) = chat_id {
-                client.delete_chat_reliable(&token, &cid, attempts, delay).await;
+                client
+                    .delete_chat_reliable(&token, &cid, attempts, delay)
+                    .await;
             }
             if let Some(em) = email {
                 pool.release(&em).await;
@@ -116,7 +122,12 @@ impl Drop for StreamGuard {
 }
 
 impl Executor {
-    pub fn new(pool: Arc<AccountPool>, client: Arc<QwenClient>, chat_id_pool: Arc<ChatIdPool>, settings: &Settings) -> Self {
+    pub fn new(
+        pool: Arc<AccountPool>,
+        client: Arc<QwenClient>,
+        chat_id_pool: Arc<ChatIdPool>,
+        settings: &Settings,
+    ) -> Self {
         Executor {
             pool,
             client,
@@ -166,11 +177,8 @@ impl Executor {
 
             for attempt in 0..attempts {
                 // 1) 取得帳號
-                let handle = if let Some(email) = &params.fixed_account {
-                    match self.pool.token_of(email).await {
-                        Some(token) => crate::account::AccountHandle { email: email.clone(), token },
-                        None => { yield UpstreamEvent::Error(format!("指定帳號不存在: {email}")); return; }
-                    }
+                let handle = if let Some(fixed) = &params.fixed_account {
+                    fixed.clone()
                 } else {
                     match self.pool.acquire_wait(None, &exclude, 60.0).await {
                         Some(h) => h,
@@ -186,13 +194,12 @@ impl Executor {
                 };
                 let email = handle.email.clone();
                 let token = handle.token.clone();
-                let is_pool_acquired = params.fixed_account.is_none();
 
                 // 取消安全 guard：取得帳號後立刻建立，所有離開路徑（成功/重試/錯誤/斷線）皆由它清理。
                 let mut guard = StreamGuard {
                     pool: self.pool.clone(),
                     client: self.client.clone(),
-                    email: if is_pool_acquired { Some(email.clone()) } else { None },
+                    email: Some(email.clone()),
                     token: token.clone(),
                     chat_id: None,
                     delete_attempts: self.delete_attempts,
@@ -325,9 +332,7 @@ impl Executor {
                             tracing::warn!("[執行器] 無 answer 內容視為失敗 第{}次 email={email}", attempt + 1);
                             continue;
                         }
-                        if is_pool_acquired {
-                            self.pool.mark_success(&email).await;
-                        }
+                        self.pool.mark_success(&email).await;
                         yield UpstreamEvent::Done;
                         return; // guard drop → 刪會話 + 釋放帳號
                     }
@@ -443,9 +448,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -456,13 +459,21 @@ mod tests {
     #[test]
     fn aliyun_quota_exceeded_is_swap_retryable() {
         let real = "Qwen upstream error code=internal_error request_id=a79b... details=Allocated quota exceeded, please increase your quota limit. For details, see: https://help.aliyun.com/zh/model-studio/error-code#token-limit";
-        assert!(is_account_swap_retryable(real), "Allocated quota exceeded 應走跨帳號重試");
+        assert!(
+            is_account_swap_retryable(real),
+            "Allocated quota exceeded 應走跨帳號重試"
+        );
     }
 
     /// 429 / rate limit 系列
     #[test]
     fn rate_limit_variants_are_swap_retryable() {
-        for s in ["HTTP 429 Too Many Requests", "rate limit exceeded", "RateLimited", "too many requests"] {
+        for s in [
+            "HTTP 429 Too Many Requests",
+            "rate limit exceeded",
+            "RateLimited",
+            "too many requests",
+        ] {
             assert!(is_account_swap_retryable(s), "應為 swap-retryable: {s}");
         }
     }
@@ -500,7 +511,13 @@ mod tests {
     fn data_inspection_false_positive_is_swap_retryable() {
         let real_input = "Qwen upstream error code=data_inspection_failed request_id=f9b6df2a-788a-460b-bb15-99a0dcb0f5c1 details=内容安全警告：输入数据可能包含不适当的内容！";
         let real_output = "Qwen upstream error code=data_inspection_failed details=内容安全警告：输出内容可能包含不适当的内容！";
-        assert!(is_account_swap_retryable(real_input), "input 端內容安全 false-positive 應給跨帳號重試機會");
-        assert!(is_account_swap_retryable(real_output), "output 端 false-positive 同理");
+        assert!(
+            is_account_swap_retryable(real_input),
+            "input 端內容安全 false-positive 應給跨帳號重試機會"
+        );
+        assert!(
+            is_account_swap_retryable(real_output),
+            "output 端 false-positive 同理"
+        );
     }
 }

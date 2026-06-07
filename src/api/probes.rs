@@ -2,6 +2,7 @@
 
 use crate::state::AppState;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
@@ -20,4 +21,12 @@ pub async fn root() -> impl IntoResponse {
         "status": "qwen2API Enterprise Gateway (Rust) is running",
         "version": "2.0.0"
     }))
+}
+
+pub async fn keepalive() -> impl IntoResponse {
+    Json(json!({ "ok": true, "service": "qwen2api-rs" }))
+}
+
+pub async fn keepalive_head() -> StatusCode {
+    StatusCode::NO_CONTENT
 }

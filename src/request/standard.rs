@@ -1,5 +1,6 @@
 //! 內部標準請求，對應 Python `adapter/standard_request.py` 的 StandardRequest。
 
+use crate::account::AccountHandle;
 use crate::upstream::ImageOptions;
 use std::collections::HashSet;
 
@@ -29,7 +30,7 @@ pub struct StandardRequest {
     /// 附件上傳後的 remote_ref，放進上游 payload 的 files。
     pub files: Vec<serde_json::Value>,
     /// 綁定帳號（若有附件上傳，須用同一帳號對話）。
-    pub bound_account: Option<String>,
+    pub bound_account: Option<AccountHandle>,
     /// 呼叫者識別（API key，僅用於統計分組；不參與上游請求）。
     pub caller: Option<String>,
     /// 本次請求要繞過的帳號集合（如：t2v 已知無權限的帳號）。空＝不限。

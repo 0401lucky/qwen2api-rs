@@ -989,24 +989,30 @@ async function loadKeys() {
     return;
   }
   setConn(true);
-  const keys = (r.data && r.data.keys) || [];
+  const items = (r.data && r.data.items) || [];
+  const keys = items.length
+    ? items.map(item => item.key)
+    : ((r.data && r.data.keys) || []);
   host.innerHTML = '';
   if (!keys.length) {
     host.appendChild(el('div', { class: 'empty' }, [el('span', { class: 'big' }, '🔑'), '暂无 Key，点击右上角生成']));
     return;
   }
   const rows = keys.map((k, i) => {
+    const item = items[i] || { key: k, source: 'managed' };
+    const source = item.source === 'env' ? '环境变量' : '面板创建';
     const enc = encodeURIComponent(k);
     return `<tr>
       <td>${i + 1}</td>
       <td class="mono">${escapeHtml(k)}</td>
+      <td>${source}</td>
       <td><div class="cell-actions">
         <button class="btn btn-sm" data-act="copy" data-key="${escapeHtml(k)}">复制</button>
-        <button class="btn btn-sm btn-danger" data-act="del" data-enc="${escapeHtml(enc)}" data-key="${escapeHtml(k)}">删除</button>
+        <button class="btn btn-sm btn-danger" data-act="del" data-enc="${escapeHtml(enc)}" data-key="${escapeHtml(k)}" ${item.source === 'env' ? 'disabled' : ''}>删除</button>
       </div></td>
     </tr>`;
   }).join('');
-  const tbl = elTable(['序号', 'API Key', '操作'], rows);
+  const tbl = elTable(['序号', 'API Key', '来源', '操作'], rows);
   host.appendChild(tbl);
   tbl.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-act]');
@@ -1043,6 +1049,132 @@ async function genKey() {
    ============================================================ */
 
 const FALLBACK_MODEL = { id: 'qwen3.7-plus', family: '默认', display_name: 'qwen3.7-plus', capabilities: {} };
+const FALLBACK_IMAGE_MODEL = {
+  id: FALLBACK_MODEL.id + '-image',
+  base_model: FALLBACK_MODEL.id,
+  family: FALLBACK_MODEL.family,
+  mode: 'image',
+  display_name: FALLBACK_MODEL.id + ' image',
+  capabilities: { image_gen: true },
+};
+const FALLBACK_VIDEO_MODEL = {
+  id: FALLBACK_MODEL.id + '-video',
+  base_model: FALLBACK_MODEL.id,
+  family: FALLBACK_MODEL.family,
+  mode: 'video',
+  display_name: FALLBACK_MODEL.id + ' video',
+  capabilities: { video_gen: true },
+};
+const MODEL_MODE_SUFFIX_RE = /-(thinking|search|deep-research|deep_research|image|video|webdev|web-dev|slides|t2i|t2v)$/i;
+const GENERATION_MODES = new Set(['image', 'video', 'web_dev', 'webdev', 'slides']);
+
+function inferModelMode(modelId) {
+  const id = String(modelId || '').toLowerCase();
+  if (id.endsWith('-thinking')) return 'thinking';
+  if (id.endsWith('-search')) return 'search';
+  if (id.endsWith('-deep-research') || id.endsWith('-deep_research')) return 'deep_research';
+  if (id.endsWith('-image') || id.endsWith('-t2i')) return 'image';
+  if (id.endsWith('-video') || id.endsWith('-t2v')) return 'video';
+  if (id.endsWith('-webdev') || id.endsWith('-web-dev')) return 'web_dev';
+  if (id.endsWith('-slides')) return 'slides';
+  return 'chat';
+}
+
+function modelMode(option) {
+  return option && option.mode ? option.mode : inferModelMode(option && option.id);
+}
+
+function normalizeModelOption(value) {
+  if (typeof value === 'string' && value) {
+    return { id: value, mode: inferModelMode(value), capabilities: {} };
+  }
+  if (!value || typeof value !== 'object' || !value.id) return null;
+  return {
+    id: String(value.id),
+    base_model: value.base_model ? String(value.base_model) : undefined,
+    family: value.family ? String(value.family) : undefined,
+    mode: value.mode ? String(value.mode) : inferModelMode(value.id),
+    display_name: value.display_name ? String(value.display_name) : undefined,
+    capabilities: value.capabilities && typeof value.capabilities === 'object' ? value.capabilities : {},
+  };
+}
+
+function modelFamily(option) {
+  if (option.family) return option.family;
+  const base = option.base_model || option.id.replace(MODEL_MODE_SUFFIX_RE, '');
+  if (base.startsWith('qwen3.')) {
+    const parts = base.split('-', 1)[0].split('.');
+    if (parts.length >= 2) return parts.slice(0, 2).join('.');
+  }
+  return base.split('-', 1)[0] || 'Qwen';
+}
+
+function formatModelModeLabel(mode) {
+  const labels = {
+    chat: '对话',
+    thinking: '思考',
+    search: '搜索',
+    deep_research: '深研',
+    image: '图片',
+    video: '视频',
+    web_dev: 'Web',
+    webdev: 'Web',
+    slides: 'PPT',
+  };
+  return labels[mode] || '对话';
+}
+
+function formatModelOptionLabel(option) {
+  const name = option.display_name || option.id;
+  return name + ' · ' + formatModelModeLabel(modelMode(option));
+}
+
+async function fetchModelOptions() {
+  const r = await api('/v1/models');
+  const items = (r.ok && r.data && Array.isArray(r.data.data)) ? r.data.data : [];
+  return items.map(normalizeModelOption).filter(Boolean);
+}
+
+function filterMediaModels(options, kind) {
+  const mode = kind === 'video' ? 'video' : 'image';
+  const capKey = kind === 'video' ? 'video_gen' : 'image_gen';
+  const suffix = kind === 'video' ? '-video' : '-image';
+  const fallback = kind === 'video' ? FALLBACK_VIDEO_MODEL : FALLBACK_IMAGE_MODEL;
+  const explicit = options.filter(o => modelMode(o) === mode);
+  if (explicit.length) return explicit;
+  const capable = options
+    .filter(o => o.capabilities && o.capabilities[capKey] && !GENERATION_MODES.has(modelMode(o)))
+    .map(o => Object.assign({}, o, {
+      id: o.id.endsWith(suffix) ? o.id : o.id + suffix,
+      base_model: o.base_model || o.id,
+      mode,
+      display_name: (o.display_name || o.id) + ' ' + mode,
+      capabilities: kind === 'video' ? { video_gen: true } : { image_gen: true },
+    }));
+  return capable.length ? capable : [fallback];
+}
+
+function chooseDefaultModel(options, currentModel, preferredId) {
+  if (currentModel && options.some(o => o.id === currentModel)) return currentModel;
+  if (preferredId && options.some(o => o.id === preferredId)) return preferredId;
+  return (options[0] && options[0].id) || preferredId || FALLBACK_MODEL.id;
+}
+
+function fillModelSelect(selectEl, options) {
+  selectEl.innerHTML = '';
+  const groups = {};
+  options.forEach(o => {
+    const fam = modelFamily(o);
+    (groups[fam] = groups[fam] || []).push(o);
+  });
+  Object.keys(groups).sort().forEach(fam => {
+    const og = el('optgroup', { label: fam });
+    groups[fam].sort((a, b) => a.id.localeCompare(b.id)).forEach(o => {
+      og.appendChild(el('option', { value: o.id }, formatModelOptionLabel(o)));
+    });
+    selectEl.appendChild(og);
+  });
+}
 
 function renderTest() {
   const v = viewEl();
@@ -1366,7 +1498,8 @@ function renderMediaPage(kind) {
   const isVideo = kind === 'video';
   const v = viewEl();
   const ratios = isVideo ? VIDEO_RATIOS_NEW : ASPECT_RATIOS;
-  const state = { ratio: ratios[0].ratio };
+  const fallbackModel = isVideo ? FALLBACK_VIDEO_MODEL : FALLBACK_IMAGE_MODEL;
+  const state = { ratio: ratios[0].ratio, model: fallbackModel.id };
 
   v.appendChild(el('div', { class: 'page-head' }, [
     el('div', null, [
@@ -1380,6 +1513,29 @@ function renderMediaPage(kind) {
   // 控件：prompt（textarea，每行一个提示词）+ 比例 + 数量（仅图片）
   const promptInput = el('textarea', { class: 'textarea', rows: '3',
     placeholder: isVideo ? '描述你想生成的影片画面…' : '描述你想生成的画面（每行一个提示词，可批次提交）…' });
+  const modelSel = el('select', {
+    class: 'select',
+    id: isVideo ? 'videoModel' : 'imageModel',
+    onchange: () => { state.model = modelSel.value || fallbackModel.id; },
+  }, [el('option', { value: fallbackModel.id }, '加载模型中…')]);
+  modelSel.disabled = true;
+
+  (async function loadMediaModels() {
+    let allModels = [];
+    try {
+      allModels = await fetchModelOptions();
+    } catch (e) {
+      allModels = [];
+    }
+    const models = filterMediaModels(allModels, kind);
+    fillModelSelect(modelSel, models);
+    state.model = chooseDefaultModel(models, state.model, fallbackModel.id);
+    modelSel.value = state.model;
+    modelSel.disabled = false;
+    if (!allModels.length) {
+      toast((isVideo ? '视频' : '图片') + '模型列表获取失败，已使用默认模型', 'info');
+    }
+  })();
 
   const ratioGrid = el('div', { class: 'ratio-grid' }, ratios.map(r =>
     el('button', {
@@ -1414,6 +1570,10 @@ function renderMediaPage(kind) {
     el('div', { class: 'card-title' }, '提交任务'),
     el('div', { class: 'img-controls' }, [
       el('div', { class: 'field' }, [
+        el('label', null, isVideo ? '视频模型' : '图片模型'),
+        modelSel,
+      ]),
+      el('div', { class: 'field' }, [
         el('label', null, isVideo ? '提示词' : '提示词（多行＝批次）'),
         promptInput,
       ]),
@@ -1447,12 +1607,15 @@ function renderMediaPage(kind) {
     const prompts = isVideo
       ? [raw]
       : raw.split('\n').map(s => s.trim()).filter(Boolean);
+    const model = modelSel.value || state.model || fallbackModel.id;
+    state.model = model;
     const body = isVideo
-      ? { kind: 'video', prompt: prompts[0], ratio: state.ratio }
+      ? { kind: 'video', model, prompt: prompts[0], ratio: state.ratio }
       : (() => {
           const r = ASPECT_RATIOS.find(x => x.ratio === state.ratio);
           return {
             kind: 'image',
+            model,
             prompts,
             ratio: state.ratio,
             size: `${r.w}x${r.h}`,
@@ -1517,8 +1680,10 @@ function renderTaskCard(t, isVideo) {
   const STATUS_CLS = { queued: 'badge-gray', running: 'badge-orange', done: 'badge-green', failed: 'badge-red' };
   const dt = new Date(t.ts_created || Date.now());
   const dur = (t.ts_done && t.ts_created) ? ((t.ts_done - t.ts_created) / 1000).toFixed(1) + 's' : '';
+  const taskModel = t.params && t.params.model ? String(t.params.model) : '';
   card.appendChild(el('div', { class: 'task-head' }, [
     el('span', { class: 'badge ' + (STATUS_CLS[t.status] || 'badge-gray') }, STATUS_CN[t.status] || t.status),
+    taskModel ? el('span', { class: 'task-model', title: taskModel }, taskModel) : null,
     el('span', { class: 'task-time' }, fmtClock(t.ts_created) + (dur ? ` · ${dur}` : '')),
     t.attempts > 1 ? el('span', { class: 'task-meta' }, `🔁 ${t.attempts} 次`) : null,
   ]));
