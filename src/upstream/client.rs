@@ -4,12 +4,13 @@
 use crate::error::{AppError, AppResult};
 use crate::util::now_unix;
 use arc_swap::ArcSwap;
+use reqwest::header::CONTENT_TYPE;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const BASE_URL: &str = "https://chat.qwen.ai";
-pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 /// signin 的密碼校驗格式（chat.qwen.ai 後端比對的是 sha256 hex，不是明文）。
 fn sha256_hex(s: &str) -> String {
@@ -43,6 +44,161 @@ fn build_http(proxy: Option<&str>) -> reqwest::Client {
     b.build().expect("建立 reqwest client 失敗")
 }
 
+fn body_preview(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+    trimmed.chars().take(max_chars).collect()
+}
+
+fn normalize_upstream_chat_type(chat_type: &str) -> &str {
+    match chat_type.trim() {
+        "" => "t2t",
+        "image_gen" | "t2i" => "t2i",
+        other => other,
+    }
+}
+
+fn likely_auth_issue(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("invalid token")
+        || lower.contains("expired token")
+        || lower.contains("token expired")
+        || lower.contains("please login")
+        || lower.contains("sign in")
+}
+
+fn likely_html_or_waf(text: &str, content_type: Option<&str>) -> bool {
+    let lower = text.to_lowercase();
+    content_type
+        .map(|ct| ct.to_lowercase().contains("text/html"))
+        .unwrap_or(false)
+        || lower.starts_with("<!doctype")
+        || lower.starts_with("<html")
+        || lower.contains("aliyun_waf")
+        || lower.contains("captcha")
+        || lower.contains("verify")
+}
+
+fn first_json_string<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut cur = v;
+    for key in path {
+        cur = cur.get(*key)?;
+    }
+    cur.as_str().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn create_chat_error_detail(v: &Value) -> Option<String> {
+    for path in [
+        &["detail"][..],
+        &["message"][..],
+        &["error"][..],
+        &["data", "message"][..],
+        &["data", "details"][..],
+        &["data", "code"][..],
+        &["error", "message"][..],
+        &["error", "details"][..],
+        &["error", "code"][..],
+    ] {
+        if let Some(s) = first_json_string(v, path) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+fn classify_upstream_body(
+    stage: &str,
+    status: u16,
+    content_type: Option<&str>,
+    text: &str,
+) -> AppError {
+    let preview = body_preview(text, 200);
+    if likely_html_or_waf(text, content_type) {
+        return AppError::Upstream(format!(
+            "{stage} HTTP {status} HTML/WAF challenge response (可能需要滑动验证): {preview}"
+        ));
+    }
+    if status == 401 || status == 403 || likely_auth_issue(text) {
+        return AppError::Unauthorized(format!("{stage} HTTP {status}: {preview}"));
+    }
+    if status == 429 {
+        return AppError::Upstream(format!("429 Too Many Requests: {preview}"));
+    }
+    AppError::Upstream(format!("{stage} HTTP {status}: {preview}"))
+}
+
+fn parse_create_chat_response(
+    status: u16,
+    content_type: Option<&str>,
+    text: &str,
+) -> AppResult<String> {
+    if status != 200 {
+        return Err(classify_upstream_body(
+            "create_chat",
+            status,
+            content_type,
+            text,
+        ));
+    }
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Upstream(
+            "create_chat empty response (HTTP 200)".into(),
+        ));
+    }
+
+    let data: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            let preview = body_preview(trimmed, 200);
+            if likely_auth_issue(trimmed) {
+                return Err(AppError::Unauthorized(format!(
+                    "create_chat non-JSON auth response: {preview}"
+                )));
+            }
+            if likely_html_or_waf(trimmed, content_type) {
+                return Err(AppError::Upstream(format!(
+                    "create_chat non-JSON HTML/WAF response: {preview}"
+                )));
+            }
+            return Err(AppError::Upstream(format!(
+                "create_chat parse error: {e}; body={preview}"
+            )));
+        }
+    };
+
+    let id = data
+        .get("data")
+        .and_then(|d| d.get("id"))
+        .and_then(|i| i.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if data.get("success") != Some(&Value::Bool(true)) {
+        let detail = create_chat_error_detail(&data).unwrap_or_else(|| body_preview(trimmed, 200));
+        if likely_auth_issue(&detail) || likely_auth_issue(trimmed) {
+            return Err(AppError::Unauthorized(format!(
+                "create_chat returned auth error: {detail}"
+            )));
+        }
+        return Err(AppError::Upstream(format!(
+            "Qwen API returned success=false: {detail}"
+        )));
+    }
+
+    id.map(|s| s.to_string()).ok_or_else(|| {
+        AppError::Upstream(format!(
+            "create_chat 缺少 data.id: {}",
+            body_preview(trimmed, 200)
+        ))
+    })
+}
+
 pub struct QwenClient {
     /// 可熱抽換的 HTTP client（切換出口代理時整個重建並 swap）。
     http: ArcSwap<reqwest::Client>,
@@ -63,7 +219,11 @@ impl QwenClient {
     pub fn set_proxy(&self, proxy: Option<String>) {
         let normalized = proxy.and_then(|p| {
             let t = p.trim().to_string();
-            if t.is_empty() { None } else { Some(t) }
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
         });
         let http = build_http(normalized.as_deref());
         self.http.store(Arc::new(http));
@@ -90,6 +250,15 @@ impl QwenClient {
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
             .header("Referer", "https://chat.qwen.ai/")
             .header("Origin", "https://chat.qwen.ai")
+            .header(
+                "sec-ch-ua",
+                r#""Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99""#,
+            )
+            .header("sec-ch-ua-mobile", "?0")
+            .header("sec-ch-ua-platform", r#""Windows""#)
+            .header("sec-fetch-dest", "empty")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-site", "same-origin")
     }
 
     /// chat.qwen.ai 純 HTTP 重登（取代過期 / 即將過期的 token）。
@@ -100,7 +269,9 @@ impl QwenClient {
     /// 細節見 memory `reference-qwen-signin-protocol`。
     pub async fn signin(&self, email: &str, plain_password: &str) -> AppResult<String> {
         if plain_password.is_empty() {
-            return Err(AppError::Unauthorized("帳號無 password 欄位，無法重登".into()));
+            return Err(AppError::Unauthorized(
+                "帳號無 password 欄位，無法重登".into(),
+            ));
         }
         let url = format!("{BASE_URL}/api/v1/auths/signin");
         let body = serde_json::json!({
@@ -117,6 +288,15 @@ impl QwenClient {
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
             .header("Referer", "https://chat.qwen.ai/auth")
             .header("Origin", "https://chat.qwen.ai")
+            .header(
+                "sec-ch-ua",
+                r#""Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99""#,
+            )
+            .header("sec-ch-ua-mobile", "?0")
+            .header("sec-ch-ua-platform", r#""Windows""#)
+            .header("sec-fetch-dest", "empty")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-site", "same-origin")
             .timeout(Duration::from_secs(20))
             .json(&body)
             .send()
@@ -139,9 +319,13 @@ impl QwenClient {
             .and_then(|v| v.get("detail").and_then(|d| d.as_str()).map(String::from))
             .unwrap_or_else(|| text.chars().take(160).collect());
         if matches!(status, 400 | 401 | 403) {
-            Err(AppError::Unauthorized(format!("signin HTTP {status}: {detail}")))
+            Err(AppError::Unauthorized(format!(
+                "signin HTTP {status}: {detail}"
+            )))
         } else {
-            Err(AppError::Upstream(format!("signin HTTP {status}: {detail}")))
+            Err(AppError::Upstream(format!(
+                "signin HTTP {status}: {detail}"
+            )))
         }
     }
 
@@ -185,20 +369,29 @@ impl QwenClient {
         {
             Ok(r) if r.status().as_u16() == 200 => {
                 let v: Value = r.json().await.unwrap_or(Value::Null);
-                v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default()
+                v.get("data")
+                    .and_then(|d| d.as_array())
+                    .cloned()
+                    .unwrap_or_default()
             }
             _ => Vec::new(),
         }
     }
 
     /// 建立會話 POST /api/v2/chats/new → chat_id。
-    pub async fn create_chat(&self, token: &str, model: &str, chat_type: &str) -> AppResult<String> {
+    pub async fn create_chat(
+        &self,
+        token: &str,
+        model: &str,
+        chat_type: &str,
+    ) -> AppResult<String> {
         let ts = now_unix();
+        let upstream_chat_type = normalize_upstream_chat_type(chat_type);
         let body = serde_json::json!({
             "title": format!("api_{ts}"),
             "models": [model],
             "chat_mode": "normal",
-            "chat_type": chat_type,
+            "chat_type": upstream_chat_type,
             "timestamp": ts,
         });
         let url = format!("{BASE_URL}/api/v2/chats/new");
@@ -211,48 +404,13 @@ impl QwenClient {
             .await
             .map_err(|e| AppError::Upstream(format!("create_chat 連線失敗: {e}")))?;
         let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
         let text = resp.text().await.unwrap_or_default();
-        if status != 200 {
-            let lower = text.to_lowercase();
-            if status == 401
-                || status == 403
-                || lower.contains("unauthorized")
-                || lower.contains("forbidden")
-                || lower.contains("login")
-            {
-                return Err(AppError::Unauthorized(format!(
-                    "create_chat HTTP {status}: {}",
-                    &text.chars().take(100).collect::<String>()
-                )));
-            }
-            if status == 429 {
-                return Err(AppError::Upstream("429 Too Many Requests".into()));
-            }
-            return Err(AppError::Upstream(format!(
-                "create_chat HTTP {status}: {}",
-                &text.chars().take(120).collect::<String>()
-            )));
-        }
-        let data: Value = serde_json::from_str(&text)
-            .map_err(|e| AppError::Upstream(format!("create_chat parse error: {e}")))?;
-        if data.get("success") != Some(&Value::Bool(true)) {
-            let lower = text.to_lowercase();
-            if ["html", "login", "unauthorized", "token", "expired", "invalid", "pending", "activation"]
-                .iter()
-                .any(|k| lower.contains(k))
-            {
-                return Err(AppError::Unauthorized(format!(
-                    "account issue: {}",
-                    &text.chars().take(160).collect::<String>()
-                )));
-            }
-            return Err(AppError::Upstream("Qwen API returned success=false".into()));
-        }
-        data.get("data")
-            .and_then(|d| d.get("id"))
-            .and_then(|i| i.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| AppError::Upstream("create_chat 缺少 data.id".into()))
+        parse_create_chat_response(status, content_type.as_deref(), &text)
     }
 
     /// 刪除會話 DELETE /api/v2/chats/{chat_id}（200/204/404 視為成功）。
@@ -273,7 +431,13 @@ impl QwenClient {
     }
 
     /// 帶有限重試的刪除。
-    pub async fn delete_chat_reliable(&self, token: &str, chat_id: &str, attempts: u32, delay_ms: u64) {
+    pub async fn delete_chat_reliable(
+        &self,
+        token: &str,
+        chat_id: &str,
+        attempts: u32,
+        delay_ms: u64,
+    ) {
         let max = attempts.max(1);
         for attempt in 1..=max {
             if self.delete_chat(token, chat_id).await {
@@ -287,7 +451,12 @@ impl QwenClient {
     }
 
     /// 發起串流補全，回傳 reqwest Response（呼叫端做 SSE framing）。
-    pub async fn start_stream(&self, token: &str, chat_id: &str, payload: &Value) -> AppResult<reqwest::Response> {
+    pub async fn start_stream(
+        &self,
+        token: &str,
+        chat_id: &str,
+        payload: &Value,
+    ) -> AppResult<reqwest::Response> {
         let url = format!("{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}");
         let resp = self
             .req(reqwest::Method::POST, url, token)
@@ -298,18 +467,81 @@ impl QwenClient {
             .await
             .map_err(|e| AppError::Upstream(format!("stream 連線失敗: {e}")))?;
         let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
         if status != 200 {
             let body = resp.text().await.unwrap_or_default();
-            let body = body.chars().take(200).collect::<String>();
-            if status == 429 {
-                return Err(AppError::Upstream(format!("429: {body}")));
-            }
-            if status == 401 || status == 403 {
-                return Err(AppError::Unauthorized(format!("HTTP {status}: {body}")));
-            }
-            return Err(AppError::Upstream(format!("HTTP {status}: {body}")));
+            return Err(classify_upstream_body(
+                "stream",
+                status,
+                content_type.as_deref(),
+                &body,
+            ));
+        }
+        let ct_lower = content_type
+            .as_deref()
+            .map(|ct| ct.to_lowercase())
+            .unwrap_or_default();
+        if ct_lower.contains("text/html") || ct_lower.contains("application/json") {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(classify_upstream_body(
+                "stream",
+                status,
+                content_type.as_deref(),
+                &body,
+            ));
         }
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_upstream_chat_type, parse_create_chat_response};
+    use crate::error::AppError;
+
+    #[test]
+    fn parse_create_chat_success_extracts_id() {
+        let id = parse_create_chat_response(
+            200,
+            Some("application/json"),
+            r#"{"success":true,"data":{"id":"abc123"}}"#,
+        )
+        .expect("應成功解析 chat_id");
+
+        assert_eq!(id, "abc123");
+    }
+
+    #[test]
+    fn parse_create_chat_empty_body_is_clear_upstream_error() {
+        let err = parse_create_chat_response(200, Some("application/json"), "").unwrap_err();
+
+        assert!(matches!(err, AppError::Upstream(_)));
+        assert!(err.to_string().contains("empty response"));
+    }
+
+    #[test]
+    fn parse_create_chat_waf_html_is_not_auth_error() {
+        let err = parse_create_chat_response(
+            403,
+            Some("text/html"),
+            r#"<!doctype html><meta name="aliyun_waf_aa" content="x">"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::Upstream(_)));
+        assert!(err.to_string().contains("HTML/WAF"));
+    }
+
+    #[test]
+    fn normalize_image_alias_for_create_chat() {
+        assert_eq!(normalize_upstream_chat_type(""), "t2t");
+        assert_eq!(normalize_upstream_chat_type("image_gen"), "t2i");
+        assert_eq!(normalize_upstream_chat_type("t2i"), "t2i");
+        assert_eq!(normalize_upstream_chat_type("t2v"), "t2v");
     }
 }
 

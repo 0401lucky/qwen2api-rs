@@ -156,7 +156,7 @@ WantedBy=multi-user.target
 | `MAX_INFLIGHT_PER_ACCOUNT` | 每帳號同時在途請求數 | `2` |
 | `MAX_RETRIES` | 跨帳號重試次數 | `3` |
 | `ACCOUNT_MIN_INTERVAL_MS` | 同帳號最小請求間隔（風控） | `3000` |
-| `CHAT_ID_PREWARM_TARGET_PER_ACCOUNT` | chat_id 預熱池每帳號目標數 | `5` |
+| `CHAT_ID_PREWARM_TARGET_PER_ACCOUNT` | chat_id 預熱池每帳號目標數（0=停用，降低 WAF 風險） | `0` |
 | `DEFAULT_MODEL` | 未知下游模型回退 | `qwen3.7-plus` |
 | `DATA_DIR` | 資料目錄 | `./data` |
 

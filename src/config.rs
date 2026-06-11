@@ -210,7 +210,7 @@ impl Settings {
             rate_limit_max_cooldown: env_or("RATE_LIMIT_MAX_COOLDOWN", 3600u64),
             chat_delete_retry_attempts: env_or("CHAT_DELETE_RETRY_ATTEMPTS", 3u32),
             chat_delete_retry_delay_ms: (env_or::<f64>("CHAT_DELETE_RETRY_DELAY_SECONDS", 0.5) * 1000.0) as u64,
-            chat_id_prewarm_target_per_account: env_or("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 5usize),
+            chat_id_prewarm_target_per_account: env_or("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 0usize),
             chat_id_prewarm_ttl_seconds: env_or("CHAT_ID_PREWARM_TTL_SECONDS", 120u64),
             chat_id_prewarm_max_accounts: env_or("CHAT_ID_PREWARM_MAX_ACCOUNTS", 8usize),
             log_level: env_str("LOG_LEVEL", "info"),

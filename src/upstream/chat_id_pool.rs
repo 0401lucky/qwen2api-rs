@@ -11,12 +11,14 @@
 
 use super::client::QwenClient;
 use crate::account::AccountPool;
-use crate::util::now_secs;
+use crate::util::{now_secs, now_unix};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+const WAF_PREWARM_PAUSE_SECONDS: i64 = 600;
 
 struct Entry {
     chat_id: String,
@@ -38,6 +40,7 @@ pub struct ChatIdPool {
     target: AtomicUsize,
     ttl: AtomicU64,
     max_accounts: AtomicUsize,
+    waf_pause_until: AtomicU64,
     default_model: String,
     running: AtomicBool,
 }
@@ -58,6 +61,7 @@ impl ChatIdPool {
             target: AtomicUsize::new(target),
             ttl: AtomicU64::new(ttl_seconds),
             max_accounts: AtomicUsize::new(max_accounts),
+            waf_pause_until: AtomicU64::new(0),
             default_model,
             running: AtomicBool::new(false),
         })
@@ -79,9 +83,30 @@ impl ChatIdPool {
         }
     }
 
+    pub fn pause_for_waf(&self, source: &str, err: &str) {
+        let until = now_unix().saturating_add(WAF_PREWARM_PAUSE_SECONDS) as u64;
+        let previous = self.waf_pause_until.swap(until, Ordering::Relaxed);
+        if previous < until {
+            tracing::warn!(
+                "[ChatIdPool] 命中 WAF/滑动验证，暂停预热 {} 秒 source={source} err={err}",
+                WAF_PREWARM_PAUSE_SECONDS
+            );
+        }
+    }
+
+    fn is_waf_paused(&self) -> bool {
+        let until = self.waf_pause_until.load(Ordering::Relaxed);
+        until > 0 && (now_unix() as u64) < until
+    }
+
     /// 取一個未過期的預熱 chat_id（pop）；過期的丟棄並背景刪除（用傳入 token）。
     /// 取用後立即 spawn 回補（命中與未命中皆補）以維持水位、跟隨熱帳號。
-    pub async fn acquire(self: &Arc<Self>, email: &str, token: &str, _model: &str) -> Option<String> {
+    pub async fn acquire(
+        self: &Arc<Self>,
+        email: &str,
+        token: &str,
+        _model: &str,
+    ) -> Option<String> {
         let ttl = self.ttl() as f64;
         let now = now_secs();
         let mut expired: Vec<String> = Vec::new();
@@ -127,7 +152,7 @@ impl ChatIdPool {
     /// 對指定帳號補滿至 target（背景任務）。以 pending 佔位避免並發過量；用傳入 token，不查帳號池。
     fn spawn_refill(self: &Arc<Self>, email: String, token: String) {
         let target = self.target();
-        if target == 0 || email.is_empty() || token.is_empty() {
+        if target == 0 || self.is_waf_paused() || email.is_empty() || token.is_empty() {
             return;
         }
         let this = self.clone();
@@ -146,17 +171,30 @@ impl ChatIdPool {
             };
             // 建會話（await 期間不持鎖）
             for _ in 0..need {
-                match this.client.create_chat(&token, &this.default_model, "t2t").await {
+                match this
+                    .client
+                    .create_chat(&token, &this.default_model, "t2t")
+                    .await
+                {
                     Ok(cid) => {
                         let mut inner = this.inner.lock().await;
                         inner
                             .cache
                             .entry(email.clone())
                             .or_default()
-                            .push_back(Entry { chat_id: cid, created: now_secs() });
+                            .push_back(Entry {
+                                chat_id: cid,
+                                created: now_secs(),
+                            });
                     }
-                    // 帳號可能失效/限流：停止本輪，剩餘配額在下方一併退回（不記錄避免刷屏）。
-                    Err(_) => break,
+                    Err(e) => {
+                        // WAF 是出口/节奏问题，后台预热继续打只会延长挑战状态。
+                        let msg = e.to_string();
+                        if is_waf_challenge_error(&msg) {
+                            this.pause_for_waf("refill", &msg);
+                        }
+                        break;
+                    }
                 }
             }
             // 退回本次全部佔位（已建立者已進 cache，不再計 pending）
@@ -171,11 +209,23 @@ impl ChatIdPool {
     }
 
     pub async fn size(&self, email: &str) -> usize {
-        self.inner.lock().await.cache.get(email).map(|d| d.len()).unwrap_or(0)
+        self.inner
+            .lock()
+            .await
+            .cache
+            .get(email)
+            .map(|d| d.len())
+            .unwrap_or(0)
     }
 
     pub async fn total_size(&self) -> usize {
-        self.inner.lock().await.cache.values().map(|d| d.len()).sum()
+        self.inner
+            .lock()
+            .await
+            .cache
+            .values()
+            .map(|d| d.len())
+            .sum()
     }
 
     pub async fn per_account_sizes(&self) -> HashMap<String, usize> {
@@ -213,7 +263,7 @@ impl ChatIdPool {
     /// 注意：日常供給已由 acquire 的 consume-triggered refill 承擔，此處僅啟動暖機與淘汰。
     async fn refill_round(self: &Arc<Self>) {
         let target = self.target();
-        if target == 0 {
+        if target == 0 || self.is_waf_paused() {
             return;
         }
 
@@ -249,6 +299,31 @@ impl ChatIdPool {
         accounts.truncate(max_accounts);
         for (email, token) in accounts {
             self.spawn_refill(email, token);
+        }
+    }
+}
+
+fn is_waf_challenge_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("html/waf")
+        || lower.contains("aliyun_waf")
+        || lower.contains("captcha")
+        || lower.contains("滑动验证")
+        || lower.contains("challenge response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_waf_challenge_error;
+
+    #[test]
+    fn detects_waf_challenge_errors() {
+        for err in [
+            "create_chat HTTP 200 HTML/WAF challenge response",
+            r#"<!doctype html><meta name="aliyun_waf_aa" content="x">"#,
+            "captcha required",
+        ] {
+            assert!(is_waf_challenge_error(err), "应识别 WAF: {err}");
         }
     }
 }

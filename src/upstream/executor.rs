@@ -216,6 +216,12 @@ impl Executor {
                     Err(e) => {
                         // guard 在 continue 時 drop → 釋放帳號
                         let msg = e.to_string();
+                        if is_waf_challenge(&msg) {
+                            self.chat_id_pool.pause_for_waf("executor_create_chat", &msg);
+                            tracing::warn!("[执行器] 建会话遭 WAF/滑动验证拦截 email={email} err={msg}");
+                            yield UpstreamEvent::Error(msg);
+                            return;
+                        }
                         last_error = Some(msg.clone());
                         self.classify_and_mark(&email, &msg).await;
                         exclude.insert(email.clone());
@@ -248,6 +254,12 @@ impl Executor {
                     Err(e) => {
                         // 串流尚未開始 → 可重試；guard 在 continue 時 drop → 刪會話 + 釋放帳號
                         let msg = e.to_string();
+                        if is_waf_challenge(&msg) {
+                            self.chat_id_pool.pause_for_waf("executor_start_stream", &msg);
+                            tracing::warn!("[执行器] 串流启动遭 WAF/滑动验证拦截 email={email} err={msg}");
+                            yield UpstreamEvent::Error(msg);
+                            return;
+                        }
                         last_error = Some(msg.clone());
                         self.classify_and_mark(&email, &msg).await;
                         exclude.insert(email.clone());
@@ -376,6 +388,10 @@ impl Executor {
     async fn classify_and_mark(&self, email: &str, err: &str) {
         // 注意：此函式只「標記帳號」，是否走重試另由呼叫端用 is_account_swap_retryable 判斷。
         let lower = err.to_lowercase();
+        // WAF/滑动验证是出口环境问题，不是账号 token 坏了；不要误标 auth_error。
+        if is_waf_challenge(&lower) {
+            return;
+        }
         // 含影片/影像每日額度上限（code=RateLimited / "upper limit for today's usage"）：
         // 視為限流並冷卻，使帳號池輪換到其他帳號（重試找有額度者）。
         if lower.contains("429")
@@ -443,6 +459,16 @@ fn is_account_swap_retryable(err: &str) -> bool {
     false
 }
 
+/// 当前出口命中阿里云 WAF/滑动验证时，换账号没有意义。
+fn is_waf_challenge(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("html/waf")
+        || lower.contains("aliyun_waf")
+        || lower.contains("captcha")
+        || lower.contains("滑动验证")
+        || lower.contains("challenge response")
+}
+
 /// 在 byte slice 中尋找子序列位置。
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
@@ -453,7 +479,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_account_swap_retryable;
+    use super::{is_account_swap_retryable, is_waf_challenge};
 
     /// 阿里云 model studio 的真實 quota 錯誤訊息（命中 `allocated quota`／`quota exceeded`／`token-limit`）
     #[test]
@@ -519,5 +545,17 @@ mod tests {
             is_account_swap_retryable(real_output),
             "output 端 false-positive 同理"
         );
+    }
+
+    /// WAF/滑动验证属于出口挑战，不能靠换账号解决。
+    #[test]
+    fn waf_challenge_is_detected() {
+        for s in [
+            "create_chat HTTP 403 HTML/WAF challenge response (可能需要滑动验证)",
+            r#"<!doctype html><meta name="aliyun_waf_aa" content="x">"#,
+            "captcha required",
+        ] {
+            assert!(is_waf_challenge(s), "应识别 WAF/滑动验证: {s}");
+        }
     }
 }

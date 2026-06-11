@@ -15,7 +15,15 @@ services:
       MAX_INFLIGHT_PER_ACCOUNT: "2"
       MAX_RETRIES: "3"
       ACCOUNT_MIN_INTERVAL_MS: "3000"   # 風控：同帳號最小間隔(毫秒)，0=不限
-      CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: "5"
+      CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: "0"
       CHAT_ID_PREWARM_MAX_ACCOUNTS: "8"
       DEFAULT_MODEL: "qwen3.7-plus"
+      # 上游风控出口代理。正式部署必须在宿主机 .env 或 shell 中设置这些变量。
+      UPSTREAM_PROXY: "${UPSTREAM_PROXY:-}"
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      http_proxy: "${http_proxy:-}"
+      https_proxy: "${https_proxy:-}"
+      NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}"
+      no_proxy: "${no_proxy:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}"
     restart: unless-stopped

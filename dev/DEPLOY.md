@@ -63,7 +63,7 @@ services:
       LOG_LEVEL: "info"
       MAX_INFLIGHT_PER_ACCOUNT: "2"
       ACCOUNT_MIN_INTERVAL_MS: "3000"     # 風控休息（同帳號最小間隔）
-      CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: "5"
+      CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: "0"     # 默认关闭预热，避免启动批量建会话触发 WAF
       CHAT_ID_PREWARM_MAX_ACCOUNTS: "8"
       DEFAULT_MODEL: "qwen3.7-plus"
       # —— 風控代理（沿用原 override，務必保留）——
