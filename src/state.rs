@@ -20,6 +20,17 @@ pub struct RuntimeConfig {
     pub upstream_proxy: Option<String>,
 }
 
+fn normalize_proxy(proxy: Option<String>) -> Option<String> {
+    proxy.and_then(|p| {
+        let t = p.trim().to_string();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    })
+}
+
 pub struct AppStateInner {
     pub settings: Settings,
     /// 模型別名映射，可在管理台運行時更新。
@@ -62,7 +73,8 @@ impl AppStateInner {
         let runtime_cfg = JsonDb::load(&settings.config_file, RuntimeConfig::default()).await;
         let initial_proxy = {
             let cfg = runtime_cfg.get().await;
-            cfg.upstream_proxy.clone().or_else(|| settings.upstream_proxy.clone())
+            normalize_proxy(cfg.upstream_proxy.clone())
+                .or_else(|| normalize_proxy(settings.upstream_proxy.clone()))
         };
         let client = Arc::new(QwenClient::new(initial_proxy));
         let chat_id_pool = ChatIdPool::new(
@@ -73,7 +85,12 @@ impl AppStateInner {
             settings.chat_id_prewarm_max_accounts,
             settings.default_model.clone(),
         );
-        let executor = Arc::new(Executor::new(pool.clone(), client.clone(), chat_id_pool.clone(), &settings));
+        let executor = Arc::new(Executor::new(
+            pool.clone(),
+            client.clone(),
+            chat_id_pool.clone(),
+            &settings,
+        ));
 
         let users_db = JsonDb::load(&settings.users_file, Vec::<User>::new()).await;
         let file_store = crate::context::file_store::FileStore::new(
@@ -85,14 +102,20 @@ impl AppStateInner {
         // 載入 api_keys.json
         let keys_file: ApiKeysFile =
             crate::db::read_json_or(&settings.api_keys_file, ApiKeysFile::default()).await;
-        let env_api_keys: HashSet<String> = crate::config::load_env_api_keys().into_iter().collect();
+        let env_api_keys: HashSet<String> =
+            crate::config::load_env_api_keys().into_iter().collect();
         let mut api_keys: HashSet<String> = keys_file.keys.into_iter().collect();
         api_keys.extend(env_api_keys.iter().cloned());
 
         let stats = crate::stats::Stats::new(&settings.stats_file);
 
-        let media_store = crate::media::MediaStore::new(&settings.media_db_file, &settings.media_dir);
-        let media_queue = crate::media::MediaQueue::new(media_store, settings.media_concurrency, settings.media_max_attempts);
+        let media_store =
+            crate::media::MediaStore::new(&settings.media_db_file, &settings.media_dir);
+        let media_queue = crate::media::MediaQueue::new(
+            media_store,
+            settings.media_concurrency,
+            settings.media_max_attempts,
+        );
 
         let no_t2v = JsonDb::load(&settings.no_t2v_file, HashSet::<String>::new()).await;
 
@@ -131,12 +154,13 @@ impl AppStateInner {
 
     /// 設定出口全局代理：即時切換 client + 持久化（None/空 = 清除，回退環境變數）。
     pub async fn set_upstream_proxy(&self, proxy: Option<String>) {
-        let normalized = proxy.and_then(|p| {
-            let t = p.trim().to_string();
-            if t.is_empty() { None } else { Some(t) }
-        });
+        let normalized = normalize_proxy(proxy);
         self.client.set_proxy(normalized.clone());
-        self.runtime_cfg.set(RuntimeConfig { upstream_proxy: normalized }).await;
+        self.runtime_cfg
+            .set(RuntimeConfig {
+                upstream_proxy: normalized,
+            })
+            .await;
     }
 
     /// 解析模型別名。映射命中則用映射值；否則若不是 qwen 系模型，回退到預設模型，
