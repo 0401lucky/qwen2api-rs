@@ -2,7 +2,7 @@
 //! 簽名演算法逐行對齊 oss2 2.19.1 的 ProviderAuthV4（見 dev/PROTOCOL.md）。
 
 use crate::error::{AppError, AppResult};
-use crate::upstream::client::{BASE_URL, UA};
+use crate::upstream::client::{qwen_request_id, BASE_URL, UA};
 use crate::util::{now_millis, utc_iso8601_basic, uuid4};
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
@@ -41,7 +41,12 @@ struct StsCreds<'a> {
 }
 
 /// 對 OSS PUT 請求做 V4 簽名，回傳 (authorization, x-oss-date, x-oss-content-sha256)。
-fn sign_put(creds: &StsCreds, bucket: &str, key: &str, content_type: &str) -> (String, String, String) {
+fn sign_put(
+    creds: &StsCreds,
+    bucket: &str,
+    key: &str,
+    content_type: &str,
+) -> (String, String, String) {
     let (xdate, ymd) = utc_iso8601_basic();
     let payload_hash = "UNSIGNED-PAYLOAD";
 
@@ -98,6 +103,7 @@ pub async fn upload_file(
     let req = |method: reqwest::Method, path: &str| {
         http.request(method, format!("{BASE_URL}{path}"))
             .header("Authorization", format!("Bearer {token}"))
+            .header("x-request-id", qwen_request_id())
             .header("User-Agent", UA)
             .header("Accept", "application/json, text/plain, */*")
             .header("Referer", "https://chat.qwen.ai/")
@@ -130,14 +136,29 @@ pub async fn upload_file(
         }
     }
     let sts = sts.ok_or_else(|| AppError::Upstream(format!("getstsToken {last_err}")))?;
-    let d = sts.get("data").ok_or_else(|| AppError::Upstream("getstsToken 缺 data".into()))?;
-    let ak = d.get("access_key_id").and_then(|v| v.as_str()).unwrap_or("");
-    let sk = d.get("access_key_secret").and_then(|v| v.as_str()).unwrap_or("");
-    let stoken = d.get("security_token").and_then(|v| v.as_str()).unwrap_or("");
+    let d = sts
+        .get("data")
+        .ok_or_else(|| AppError::Upstream("getstsToken 缺 data".into()))?;
+    let ak = d
+        .get("access_key_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sk = d
+        .get("access_key_secret")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let stoken = d
+        .get("security_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let bucket = d.get("bucketname").and_then(|v| v.as_str()).unwrap_or("");
     let endpoint = d.get("endpoint").and_then(|v| v.as_str()).unwrap_or("");
     let file_path = d.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-    let file_id = d.get("file_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let file_id = d
+        .get("file_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let region_raw = d.get("region").and_then(|v| v.as_str()).unwrap_or("");
     let region = region_raw.strip_prefix("oss-").unwrap_or(region_raw);
 
@@ -146,7 +167,12 @@ pub async fn upload_file(
     }
 
     // 2) PUT 到 OSS（V4 簽名）
-    let creds = StsCreds { ak, sk, token: stoken, region };
+    let creds = StsCreds {
+        ak,
+        sk,
+        token: stoken,
+        region,
+    };
     let (authorization, xdate, content_sha) = sign_put(&creds, bucket, file_path, content_type);
     let host = format!("{bucket}.{endpoint}");
     let put_url = format!("https://{host}/{}", v4_uri_encode(file_path, false)); // URL 路徑把 '/' 編成 %2F
@@ -165,7 +191,10 @@ pub async fn upload_file(
     if !put_resp.status().is_success() {
         let st = put_resp.status();
         let body = put_resp.text().await.unwrap_or_default();
-        return Err(AppError::Upstream(format!("OSS PUT 失敗 {st}: {}", body.chars().take(200).collect::<String>())));
+        return Err(AppError::Upstream(format!(
+            "OSS PUT 失敗 {st}: {}",
+            body.chars().take(200).collect::<String>()
+        )));
     }
 
     // 3) parse
@@ -188,7 +217,13 @@ pub async fn upload_file(
             Ok(r) => r.json().await.unwrap_or(Value::Null),
             Err(_) => Value::Null,
         };
-        if let Some(s) = st.get("data").and_then(|a| a.as_array()).and_then(|a| a.first()).and_then(|x| x.get("status")).and_then(|v| v.as_str()) {
+        if let Some(s) = st
+            .get("data")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|x| x.get("status"))
+            .and_then(|v| v.as_str())
+        {
             parse_status = s.to_string();
             if s == "success" {
                 break;

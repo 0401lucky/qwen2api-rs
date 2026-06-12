@@ -2,7 +2,7 @@
 //! 用 reqwest（rustls + http2 + 連線池）；headers 與 Python 對齊。
 
 use crate::error::{AppError, AppResult};
-use crate::util::now_unix;
+use crate::util::{now_unix, uuid4};
 use arc_swap::ArcSwap;
 use reqwest::header::CONTENT_TYPE;
 use serde_json::Value;
@@ -11,6 +11,10 @@ use std::time::Duration;
 
 pub const BASE_URL: &str = "https://chat.qwen.ai";
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+pub fn qwen_request_id() -> String {
+    uuid4()
+}
 
 /// signin 的密碼校驗格式（chat.qwen.ai 後端比對的是 sha256 hex，不是明文）。
 fn sha256_hex(s: &str) -> String {
@@ -245,6 +249,7 @@ impl QwenClient {
             .load()
             .request(method, url)
             .header("Authorization", format!("Bearer {token}"))
+            .header("x-request-id", qwen_request_id())
             .header("User-Agent", UA)
             .header("Accept", "application/json, text/plain, */*")
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
@@ -284,6 +289,7 @@ impl QwenClient {
             .post(url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
+            .header("x-request-id", qwen_request_id())
             .header("User-Agent", UA)
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
             .header("Referer", "https://chat.qwen.ai/auth")
@@ -500,7 +506,7 @@ impl QwenClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_upstream_chat_type, parse_create_chat_response};
+    use super::{normalize_upstream_chat_type, parse_create_chat_response, qwen_request_id};
     use crate::error::AppError;
 
     #[test]
@@ -542,6 +548,19 @@ mod tests {
         assert_eq!(normalize_upstream_chat_type("image_gen"), "t2i");
         assert_eq!(normalize_upstream_chat_type("t2i"), "t2i");
         assert_eq!(normalize_upstream_chat_type("t2v"), "t2v");
+    }
+
+    #[test]
+    fn qwen_request_id_is_uuid_like_and_unique() {
+        let a = qwen_request_id();
+        let b = qwen_request_id();
+
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36);
+        assert_eq!(a.chars().nth(8), Some('-'));
+        assert_eq!(a.chars().nth(13), Some('-'));
+        assert_eq!(a.chars().nth(18), Some('-'));
+        assert_eq!(a.chars().nth(23), Some('-'));
     }
 }
 
