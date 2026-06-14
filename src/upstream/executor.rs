@@ -447,6 +447,16 @@ fn is_account_swap_retryable(err: &str) -> bool {
         || lower.contains("503")
         || lower.contains("502")
         || lower.contains("504")
+        || lower.contains("connection failed")
+        || lower.contains("connection closed")
+        || lower.contains("closed before")
+        || lower.contains("prematurely closed")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("unexpected eof")
+        || lower.contains("incomplete")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
     {
         return true;
     }
@@ -513,6 +523,11 @@ mod tests {
             "HTTP 503 Service Unavailable",
             "502 Bad Gateway",
             "504 Gateway Timeout",
+            "Qwen upstream error code=codeadapter details=connection failed",
+            "stream error: connection closed before message completed",
+            "upstream prematurely closed connection",
+            "unexpected EOF while reading response",
+            "request timed out while waiting for upstream",
         ] {
             assert!(is_account_swap_retryable(s), "應為 swap-retryable: {s}");
         }

@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const BASE_URL: &str = "https://chat.qwen.ai";
-pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+pub const CHROME_MAJOR_VERSION: &str = "149";
+pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+pub const SEC_CH_UA: &str = r#""Chromium";v="149", "Google Chrome";v="149", "Not-A.Brand";v="99""#;
 
 pub fn qwen_request_id() -> String {
     uuid4()
@@ -255,10 +257,7 @@ impl QwenClient {
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
             .header("Referer", "https://chat.qwen.ai/")
             .header("Origin", "https://chat.qwen.ai")
-            .header(
-                "sec-ch-ua",
-                r#""Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99""#,
-            )
+            .header("sec-ch-ua", SEC_CH_UA)
             .header("sec-ch-ua-mobile", "?0")
             .header("sec-ch-ua-platform", r#""Windows""#)
             .header("sec-fetch-dest", "empty")
@@ -294,10 +293,7 @@ impl QwenClient {
             .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
             .header("Referer", "https://chat.qwen.ai/auth")
             .header("Origin", "https://chat.qwen.ai")
-            .header(
-                "sec-ch-ua",
-                r#""Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99""#,
-            )
+            .header("sec-ch-ua", SEC_CH_UA)
             .header("sec-ch-ua-mobile", "?0")
             .header("sec-ch-ua-platform", r#""Windows""#)
             .header("sec-fetch-dest", "empty")
@@ -506,7 +502,10 @@ impl QwenClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_upstream_chat_type, parse_create_chat_response, qwen_request_id};
+    use super::{
+        normalize_upstream_chat_type, parse_create_chat_response, qwen_request_id,
+        CHROME_MAJOR_VERSION, SEC_CH_UA, UA,
+    };
     use crate::error::AppError;
 
     #[test]
@@ -561,6 +560,13 @@ mod tests {
         assert_eq!(a.chars().nth(13), Some('-'));
         assert_eq!(a.chars().nth(18), Some('-'));
         assert_eq!(a.chars().nth(23), Some('-'));
+    }
+
+    #[test]
+    fn browser_header_versions_stay_aligned() {
+        assert!(UA.contains(&format!("Chrome/{CHROME_MAJOR_VERSION}.")));
+        assert!(SEC_CH_UA.contains(&format!(r#"Google Chrome";v="{CHROME_MAJOR_VERSION}""#)));
+        assert!(SEC_CH_UA.contains(&format!(r#"Chromium";v="{CHROME_MAJOR_VERSION}""#)));
     }
 }
 
