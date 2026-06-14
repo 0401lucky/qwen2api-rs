@@ -44,6 +44,7 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         "request_runtime": {
             "mode": "direct_http",
             "browser_required_for_requests": false,
+            "upstream_proxy_configured": state.client.proxy().is_some(),
             "description": "普通请求直连 HTTP，不经过浏览器",
         },
         "browser_automation": {

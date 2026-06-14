@@ -18,12 +18,10 @@ services:
       CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: "0"
       CHAT_ID_PREWARM_MAX_ACCOUNTS: "8"
       DEFAULT_MODEL: "qwen3.7-plus"
-      # 上游风控出口代理。默认沿用正式环境随机出口；也可用宿主机环境变量覆盖。
-      UPSTREAM_PROXY: "${UPSTREAM_PROXY:-http://ramdon:joe@192.168.1.203:2260}"
-      HTTP_PROXY: "${HTTP_PROXY:-http://ramdon:joe@192.168.1.203:2260}"
-      HTTPS_PROXY: "${HTTPS_PROXY:-http://ramdon:joe@192.168.1.203:2260}"
-      http_proxy: "${http_proxy:-http://ramdon:joe@192.168.1.203:2260}"
-      https_proxy: "${https_proxy:-http://ramdon:joe@192.168.1.203:2260}"
+      # 上游出口代理。默认不启用，避免把可用家宽出口意外切到被 WAF 拦截的代理。
+      # 需要代理时只设置 UPSTREAM_PROXY，例如：
+      # UPSTREAM_PROXY=http://user:pass@host:port
+      UPSTREAM_PROXY: "${UPSTREAM_PROXY:-}"
       NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}"
       no_proxy: "${no_proxy:-localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12}"
     restart: unless-stopped
