@@ -158,6 +158,7 @@ WantedBy=multi-user.target
 | `ACCOUNT_MIN_INTERVAL_MS` | 同帳號最小請求間隔（風控） | `3000` |
 | `CHAT_ID_PREWARM_TARGET_PER_ACCOUNT` | chat_id 預熱池每帳號目標數（0=停用，降低 WAF 風險） | `0` |
 | `DEFAULT_MODEL` | 未知下游模型回退 | `qwen3.7-plus` |
+| `UPSTREAM_PROXY` | Qwen 上游出口代理；未设置时强制直连并忽略 `HTTP_PROXY/HTTPS_PROXY` | 空 |
 | `DATA_DIR` | 資料目錄 | `./data` |
 
 ## 認證

@@ -26,7 +26,8 @@ fn sha256_hex(s: &str) -> String {
     hex::encode(h.finalize())
 }
 
-/// 依出口代理建立 reqwest client。proxy 為 None/空 → 不顯式設代理（reqwest 仍會讀 HTTP(S)_PROXY env）。
+/// 依出口代理建立 reqwest client。
+/// proxy 为 None/空时强制直连，避免 reqwest 自动读取 HTTP(S)_PROXY 等通用环境变量。
 fn build_http(proxy: Option<&str>) -> reqwest::Client {
     let mut b = reqwest::Client::builder()
         .pool_max_idle_per_host(20)
@@ -35,16 +36,20 @@ fn build_http(proxy: Option<&str>) -> reqwest::Client {
         // 讀取超時放大以支援長任務（工具調用/出圖），靠每次請求個別 timeout 控制
         .timeout(Duration::from_secs(300))
         .gzip(true);
-    if let Some(p) = proxy {
-        let p = p.trim();
-        if !p.is_empty() {
-            match reqwest::Proxy::all(p) {
-                Ok(px) => {
-                    b = b.proxy(px);
-                    tracing::info!("[QwenClient] 出口代理已啟用");
-                }
-                Err(e) => tracing::warn!("[QwenClient] 無效出口代理 {p}: {e}（忽略）"),
+    match proxy.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => match reqwest::Proxy::all(p) {
+            Ok(px) => {
+                b = b.proxy(px);
+                tracing::info!("[QwenClient] 出口代理已启用（UPSTREAM_PROXY/运行时配置）");
             }
+            Err(e) => {
+                b = b.no_proxy();
+                tracing::warn!("[QwenClient] 无效出口代理 {p}: {e}（改为直连）");
+            }
+        },
+        None => {
+            b = b.no_proxy();
+            tracing::info!("[QwenClient] 出口代理未启用，已强制直连并忽略 HTTP(S)_PROXY 环境变量");
         }
     }
     b.build().expect("建立 reqwest client 失敗")

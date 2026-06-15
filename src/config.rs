@@ -151,7 +151,8 @@ pub struct Settings {
     /// chat_id 預熱池預設模型（動態：啟動後若抓到上游模型列表會覆蓋）
     pub default_model: String,
 
-    /// 出口全局代理初始值（優先 UPSTREAM_PROXY，否則沿用 HTTP(S)_PROXY env）。
+    /// 出口全局代理初始值。仅识别 UPSTREAM_PROXY，避免通用 HTTP(S)_PROXY
+    /// 被容器或宿主环境隐式注入后，把上游请求切到容易触发 WAF 的出口。
     /// 之後可在管理台即時覆蓋並持久化。
     pub upstream_proxy: Option<String>,
 
@@ -170,14 +171,16 @@ pub struct Settings {
     pub token_refresh_jitter_max_ms: u64,
 }
 
-/// 依序讀取代理環境變數（含大小寫變體）。
+/// 读取上游代理环境变量。
+///
+/// 注意：这里故意不读取 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY。
+/// 这些通用变量经常由 Docker、CI 或系统代理隐式注入，导致 Qwen 上游请求在
+/// 管理台看似“未配置代理”时仍走代理出口，从而触发 WAF。
 fn read_proxy_env() -> Option<String> {
-    for key in ["UPSTREAM_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
-        if let Ok(v) = env::var(key) {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
+    if let Ok(v) = env::var("UPSTREAM_PROXY") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
         }
     }
     None
@@ -278,6 +281,46 @@ pub fn default_model_map() -> HashMap<String, String> {
         ("deepseek-chat", plus), ("deepseek-reasoner", plus),
     ];
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_proxy_env;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn proxy_env_only_uses_upstream_proxy() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_upstream = std::env::var("UPSTREAM_PROXY").ok();
+        let old_https = std::env::var("HTTPS_PROXY").ok();
+        let old_http = std::env::var("HTTP_PROXY").ok();
+
+        std::env::remove_var("UPSTREAM_PROXY");
+        std::env::set_var("HTTPS_PROXY", "http://proxy.example:8080");
+        std::env::set_var("HTTP_PROXY", "http://proxy.example:8080");
+        assert_eq!(read_proxy_env(), None);
+
+        std::env::set_var("UPSTREAM_PROXY", " http://upstream.example:8080 ");
+        assert_eq!(
+            read_proxy_env(),
+            Some("http://upstream.example:8080".to_string())
+        );
+
+        match old_upstream {
+            Some(v) => std::env::set_var("UPSTREAM_PROXY", v),
+            None => std::env::remove_var("UPSTREAM_PROXY"),
+        }
+        match old_https {
+            Some(v) => std::env::set_var("HTTPS_PROXY", v),
+            None => std::env::remove_var("HTTPS_PROXY"),
+        }
+        match old_http {
+            Some(v) => std::env::set_var("HTTP_PROXY", v),
+            None => std::env::remove_var("HTTP_PROXY"),
+        }
+    }
 }
 
 /// 從 model_aliases 解析實際 base model；命中則回映射值，否則原樣返回。
