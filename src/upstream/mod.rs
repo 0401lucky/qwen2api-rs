@@ -3,6 +3,7 @@ pub mod client;
 pub mod executor;
 pub mod payload;
 pub mod sse;
+mod ssxmod;
 
 pub use chat_id_pool::ChatIdPool;
 pub use client::QwenClient;
