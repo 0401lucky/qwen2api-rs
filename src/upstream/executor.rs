@@ -143,6 +143,7 @@ impl Executor {
     async fn obtain_chat_id(
         &self,
         token: &str,
+        cookies: &str,
         email: &str,
         model: &str,
         chat_type: &str,
@@ -154,12 +155,19 @@ impl Executor {
         }
         if use_prewarmed && chat_type == "t2t" {
             // 傳入 token：回補與過期刪除都用它，避免在熱路徑查 pool（O(n) 鎖競爭）。
-            if let Some(cid) = self.chat_id_pool.acquire(email, token, model).await {
+            if let Some(cid) = self
+                .chat_id_pool
+                .acquire(email, token, cookies, model)
+                .await
+            {
                 tracing::debug!("[執行器] 預熱池命中 email={email} chat={cid}");
                 return Ok((cid, true));
             }
         }
-        let cid = self.client.create_chat(token, model, chat_type).await?;
+        let cid = self
+            .client
+            .create_chat_with_cookies(token, cookies, model, chat_type)
+            .await?;
         Ok((cid, true))
     }
 
@@ -194,6 +202,7 @@ impl Executor {
                 };
                 let email = handle.email.clone();
                 let token = handle.token.clone();
+                let cookies = handle.cookies.clone();
 
                 // 取消安全 guard：取得帳號後立刻建立，所有離開路徑（成功/重試/錯誤/斷線）皆由它清理。
                 let mut guard = StreamGuard {
@@ -209,7 +218,7 @@ impl Executor {
 
                 // 2) 取得會話
                 let (chat_id, owns) = match self
-                    .obtain_chat_id(&token, &email, &params.model, &params.chat_type, &params.existing_chat_id, params.use_prewarmed)
+                    .obtain_chat_id(&token, &cookies, &email, &params.model, &params.chat_type, &params.existing_chat_id, params.use_prewarmed)
                     .await
                 {
                     Ok(v) => v,
@@ -249,7 +258,11 @@ impl Executor {
                     enable_search: params.enable_search,
                 });
 
-                let resp = match self.client.start_stream(&token, &chat_id, &payload).await {
+                let resp = match self
+                    .client
+                    .start_stream_with_cookies(&token, &cookies, &chat_id, &payload)
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => {
                         // 串流尚未開始 → 可重試；guard 在 continue 時 drop → 刪會話 + 釋放帳號

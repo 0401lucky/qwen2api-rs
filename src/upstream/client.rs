@@ -38,6 +38,44 @@ fn normalize_bearer_token(token: &str) -> String {
         .to_string()
 }
 
+fn normalize_cookie_header(cookies: &str) -> String {
+    let trimmed = cookies.trim();
+    let without_prefix = if trimmed
+        .get(..7)
+        .map(|s| s.eq_ignore_ascii_case("cookie:"))
+        .unwrap_or(false)
+    {
+        trimmed[7..].trim()
+    } else {
+        trimmed
+    };
+    without_prefix
+        .replace(['\r', '\n'], "")
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn cookie_has(cookies: &str, name: &str) -> bool {
+    let needle = format!("{}=", name.trim());
+    cookies
+        .split(';')
+        .map(str::trim)
+        .any(|part| part.starts_with(&needle))
+}
+
+fn remove_cookie(cookies: &str, name: &str) -> String {
+    let needle = format!("{}=", name.trim());
+    cookies
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && !part.starts_with(&needle))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn qwen_timezone_header() -> String {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MONTHS: [&str; 12] = [
@@ -306,6 +344,16 @@ impl QwenClient {
     }
 
     fn req(&self, method: reqwest::Method, url: String, token: &str) -> reqwest::RequestBuilder {
+        self.req_with_cookies(method, url, token, None)
+    }
+
+    fn req_with_cookies(
+        &self,
+        method: reqwest::Method,
+        url: String,
+        token: &str,
+        account_cookies: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         let raw_token = normalize_bearer_token(token);
         self.http
             .load()
@@ -319,7 +367,10 @@ impl QwenClient {
             .header("source", "web")
             .header("version", QWEN_WEB_VERSION)
             .header("bx-v", BAXIA_VERSION)
-            .header("Cookie", self.cookie_header(&raw_token))
+            .header(
+                "Cookie",
+                self.cookie_header(&raw_token, account_cookies.unwrap_or("")),
+            )
             .header("Referer", "https://chat.qwen.ai/")
             .header("Origin", "https://chat.qwen.ai")
             .header("sec-ch-ua", SEC_CH_UA)
@@ -330,16 +381,21 @@ impl QwenClient {
             .header("sec-fetch-site", "same-origin")
     }
 
-    fn cookie_header(&self, token: &str) -> String {
+    fn cookie_header(&self, token: &str, account_cookies: &str) -> String {
+        let mut parts = Vec::new();
+        let account_cookies = remove_cookie(&normalize_cookie_header(account_cookies), "token");
+        if !account_cookies.is_empty() {
+            parts.push(account_cookies.clone());
+        }
+
         let (itna, itna2) = self.ssxmod.get();
-        let mut parts = Vec::with_capacity(3);
-        if !token.trim().is_empty() {
+        if !token.trim().is_empty() && !cookie_has(&account_cookies, "token") {
             parts.push(format!("token={}", token.trim()));
         }
-        if !itna.trim().is_empty() {
+        if !itna.trim().is_empty() && !cookie_has(&account_cookies, "ssxmod_itna") {
             parts.push(format!("ssxmod_itna={itna}"));
         }
-        if !itna2.trim().is_empty() {
+        if !itna2.trim().is_empty() && !cookie_has(&account_cookies, "ssxmod_itna2") {
             parts.push(format!("ssxmod_itna2={itna2}"));
         }
         parts.join("; ")
@@ -375,7 +431,7 @@ impl QwenClient {
             .header("source", "web")
             .header("version", QWEN_WEB_VERSION)
             .header("bx-v", BAXIA_VERSION)
-            .header("Cookie", self.cookie_header(""))
+            .header("Cookie", self.cookie_header("", ""))
             .header("Referer", "https://chat.qwen.ai/auth")
             .header("Origin", "https://chat.qwen.ai")
             .header("sec-ch-ua", SEC_CH_UA)
@@ -472,6 +528,17 @@ impl QwenClient {
         model: &str,
         chat_type: &str,
     ) -> AppResult<String> {
+        self.create_chat_with_cookies(token, "", model, chat_type)
+            .await
+    }
+
+    pub async fn create_chat_with_cookies(
+        &self,
+        token: &str,
+        cookies: &str,
+        model: &str,
+        chat_type: &str,
+    ) -> AppResult<String> {
         let ts = now_millis();
         let upstream_chat_type = normalize_upstream_chat_type(chat_type);
         let body = serde_json::json!({
@@ -483,7 +550,7 @@ impl QwenClient {
         });
         let url = format!("{BASE_URL}/api/v2/chats/new");
         let resp = self
-            .req(reqwest::Method::POST, url, token)
+            .req_with_cookies(reqwest::Method::POST, url, token, Some(cookies))
             .header("Content-Type", "application/json")
             .timeout(Duration::from_secs(30))
             .json(&body)
@@ -544,9 +611,20 @@ impl QwenClient {
         chat_id: &str,
         payload: &Value,
     ) -> AppResult<reqwest::Response> {
+        self.start_stream_with_cookies(token, "", chat_id, payload)
+            .await
+    }
+
+    pub async fn start_stream_with_cookies(
+        &self,
+        token: &str,
+        cookies: &str,
+        chat_id: &str,
+        payload: &Value,
+    ) -> AppResult<reqwest::Response> {
         let url = format!("{BASE_URL}/api/v2/chat/completions?chat_id={chat_id}");
         let resp = self
-            .req(reqwest::Method::POST, url, token)
+            .req_with_cookies(reqwest::Method::POST, url, token, Some(cookies))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .json(payload)
@@ -588,7 +666,8 @@ impl QwenClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_upstream_chat_type, parse_create_chat_response, qwen_request_id,
+        cookie_has, normalize_cookie_header, normalize_upstream_chat_type,
+        parse_create_chat_response, qwen_request_id, remove_cookie, QwenClient,
         CHROME_MAJOR_VERSION, SEC_CH_UA, UA,
     };
     use crate::error::AppError;
@@ -652,6 +731,34 @@ mod tests {
         assert!(UA.contains(&format!("Chrome/{CHROME_MAJOR_VERSION}.")));
         assert!(SEC_CH_UA.contains(&format!(r#"Google Chrome";v="{CHROME_MAJOR_VERSION}""#)));
         assert!(SEC_CH_UA.contains(&format!(r#"Chromium";v="{CHROME_MAJOR_VERSION}""#)));
+    }
+
+    #[test]
+    fn normalizes_pasted_cookie_header() {
+        let normalized =
+            normalize_cookie_header("Cookie: cna=abc;\r\n ssxmod_itna=real ; token=old");
+
+        assert_eq!(normalized, "cna=abc; ssxmod_itna=real; token=old");
+        assert!(cookie_has(&normalized, "ssxmod_itna"));
+        assert_eq!(
+            remove_cookie(&normalized, "token"),
+            "cna=abc; ssxmod_itna=real"
+        );
+    }
+
+    #[test]
+    fn account_cookie_is_merged_with_current_token() {
+        let client = QwenClient::new(None);
+        let cookie = client.cookie_header(
+            "fresh-token",
+            "cna=abc; token=stale-token; ssxmod_itna=real-itna; ssxmod_itna2=real-itna2",
+        );
+
+        assert!(cookie.contains("cna=abc"));
+        assert!(cookie.contains("token=fresh-token"));
+        assert!(!cookie.contains("token=stale-token"));
+        assert!(cookie.contains("ssxmod_itna=real-itna"));
+        assert!(cookie.contains("ssxmod_itna2=real-itna2"));
     }
 }
 

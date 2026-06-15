@@ -30,6 +30,7 @@ impl Drop for WaitGuard<'_> {
 pub struct AccountHandle {
     pub email: String,
     pub token: String,
+    pub cookies: String,
 }
 
 /// f64 的全序包裝，供 BinaryHeap 當 key（NaN 不會出現於時間戳）。
@@ -83,15 +84,26 @@ impl ReadyIndex {
 
     /// 依即時狀態把 email 放到對的位置。O(log n)（push；舊殘留 lazy 丟棄）。
     /// 呼叫前帳號欄位必須已是最新值（與欄位寫入同臨界區，避免 TOCTOU）。
-    fn place(&mut self, email: &str, valid: bool, available: bool, inflight: i64, cap: i64, next_avail: f64, last_used: f64) {
+    fn place(
+        &mut self,
+        email: &str,
+        valid: bool,
+        available: bool,
+        inflight: i64,
+        cap: i64,
+        next_avail: f64,
+        last_used: f64,
+    ) {
         let l = if !valid || inflight >= cap {
             Loc::Idle
         } else if available {
             // 最小堆鍵：inflight 升序（least-loaded）、再 last_used 升序（LRU）。
-            self.ready.push(Reverse((inflight, OrdF64(last_used), email.to_string())));
+            self.ready
+                .push(Reverse((inflight, OrdF64(last_used), email.to_string())));
             Loc::Ready
         } else {
-            self.cooldown.push(Reverse((OrdF64(next_avail), email.to_string())));
+            self.cooldown
+                .push(Reverse((OrdF64(next_avail), email.to_string())));
             Loc::Cooldown
         };
         self.loc.insert(email.to_string(), l);
@@ -111,7 +123,15 @@ fn rebuild_index(st: &mut PoolState, min_ms: u64) {
         idx.pos.insert(acc.email.clone(), i);
         let avail = acc.is_available(min_ms);
         let na = acc.next_available_at(min_ms);
-        idx.place(&acc.email, acc.valid, avail, acc.inflight, cap, na, acc.last_used);
+        idx.place(
+            &acc.email,
+            acc.valid,
+            avail,
+            acc.inflight,
+            cap,
+            na,
+            acc.last_used,
+        );
     }
 }
 
@@ -123,11 +143,21 @@ fn reindex_email(st: &mut PoolState, email: &str, min_ms: u64) {
     let cap = st.max_inflight_per_account;
     let PoolState { accounts, idx, .. } = st;
     let Some(idx) = idx.as_mut() else { return };
-    let Some(&pos) = idx.pos.get(email) else { return };
+    let Some(&pos) = idx.pos.get(email) else {
+        return;
+    };
     let acc = &accounts[pos];
     let avail = acc.is_available(min_ms);
     let na = acc.next_available_at(min_ms);
-    idx.place(email, acc.valid, avail, acc.inflight, cap, na, acc.last_used);
+    idx.place(
+        email,
+        acc.valid,
+        avail,
+        acc.inflight,
+        cap,
+        na,
+        acc.last_used,
+    );
 }
 
 /// 取帳號在 Vec 的位置：index 開啟用 pos 表 O(1)；否則線性掃描（舊行為）。
@@ -185,7 +215,13 @@ impl AccountPool {
         let mut env_accounts: Vec<Account> = crate::config::load_env_accounts()
             .into_iter()
             .map(|spec| {
-                let mut acc = Account::new(spec.email, spec.password, spec.token, String::new(), String::new());
+                let mut acc = Account::new(
+                    spec.email,
+                    spec.password,
+                    spec.token,
+                    String::new(),
+                    String::new(),
+                );
                 acc.source = "env".to_string();
                 acc.env_name = spec.env_name;
                 acc.init_runtime();
@@ -195,7 +231,11 @@ impl AccountPool {
         let env_emails: HashSet<String> = env_accounts.iter().map(|a| a.email.clone()).collect();
         let mut accounts = Vec::with_capacity(env_accounts.len() + file_accounts.len());
         accounts.append(&mut env_accounts);
-        accounts.extend(file_accounts.into_iter().filter(|a| !env_emails.contains(&a.email)));
+        accounts.extend(
+            file_accounts
+                .into_iter()
+                .filter(|a| !env_emails.contains(&a.email)),
+        );
         let use_index = settings.pool_ready_index;
         let pool = AccountPool {
             state: Mutex::new(PoolState {
@@ -207,7 +247,11 @@ impl AccountPool {
                 admin_global: None,
                 sticky_email: None,
                 use_index,
-                idx: if use_index { Some(ReadyIndex::new()) } else { None },
+                idx: if use_index {
+                    Some(ReadyIndex::new())
+                } else {
+                    None
+                },
                 built_gen: 0,
             }),
             waiting: AtomicUsize::new(0),
@@ -286,7 +330,11 @@ impl AccountPool {
     }
 
     async fn persist(&self, accounts: &[Account]) {
-        let file_accounts: Vec<Account> = accounts.iter().filter(|a| a.source != "env").cloned().collect();
+        let file_accounts: Vec<Account> = accounts
+            .iter()
+            .filter(|a| a.source != "env")
+            .cloned()
+            .collect();
         write_json_atomic(&self.accounts_file, &file_accounts).await;
     }
 
@@ -378,7 +426,11 @@ impl AccountPool {
     }
 
     /// 非阻塞取得帳號。preferred 命中時優先；exclude 內的 email 跳過。
-    pub async fn acquire(&self, preferred: Option<&str>, exclude: &HashSet<String>) -> Option<AccountHandle> {
+    pub async fn acquire(
+        &self,
+        preferred: Option<&str>,
+        exclude: &HashSet<String>,
+    ) -> Option<AccountHandle> {
         let mut st = self.state.lock().await;
         self.acquire_locked(&mut st, preferred, exclude)
     }
@@ -421,7 +473,9 @@ impl AccountPool {
             .accounts
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.is_available(min_ms) && a.inflight < cap && !exclude.contains(&a.email))
+            .filter(|(_, a)| {
+                a.is_available(min_ms) && a.inflight < cap && !exclude.contains(&a.email)
+            })
             .map(|(i, _)| i)
             .collect();
         if candidates.is_empty() {
@@ -432,12 +486,25 @@ impl AccountPool {
             let bb = &st.accounts[b];
             aa.inflight
                 .cmp(&bb.inflight)
-                .then(aa.last_request_started.partial_cmp(&bb.last_request_started).unwrap_or(std::cmp::Ordering::Equal))
-                .then(aa.last_used.partial_cmp(&bb.last_used).unwrap_or(std::cmp::Ordering::Equal))
+                .then(
+                    aa.last_request_started
+                        .partial_cmp(&bb.last_request_started)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+                .then(
+                    aa.last_used
+                        .partial_cmp(&bb.last_used)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
         });
 
         let chosen = preferred
-            .and_then(|pe| candidates.iter().copied().find(|&i| st.accounts[i].email == pe))
+            .and_then(|pe| {
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|&i| st.accounts[i].email == pe)
+            })
             .unwrap_or(candidates[0]);
 
         let only_one = candidates.len() == 1;
@@ -446,7 +513,11 @@ impl AccountPool {
         acc.inflight += 1;
         acc.last_used = now;
         acc.last_request_started = now + jitter;
-        let handle = AccountHandle { email: acc.email.clone(), token: acc.token.clone() };
+        let handle = AccountHandle {
+            email: acc.email.clone(),
+            token: acc.token.clone(),
+            cookies: acc.cookies.clone(),
+        };
         st.global_in_use += 1;
         if only_one {
             st.sticky_email = Some(handle.email.clone());
@@ -469,7 +540,12 @@ impl AccountPool {
         let now = now_secs();
         let jitter = jitter_ms(self.jitter_min_ms, self.jitter_max_ms) as f64 / 1000.0;
 
-        let PoolState { accounts, idx, global_in_use, .. } = st;
+        let PoolState {
+            accounts,
+            idx,
+            global_in_use,
+            ..
+        } = st;
         let idx = idx.as_mut().expect("use_index 時 idx 必為 Some");
 
         // 1) 將到期的 cooldown 帳號移回（lazy：以 loc 為準，並依即時狀態重新放置）。
@@ -488,7 +564,15 @@ impl AccountPool {
             let acc = &accounts[pos];
             let avail = acc.is_available(min_ms);
             let na = acc.next_available_at(min_ms);
-            idx.place(&email, acc.valid, avail, acc.inflight, cap, na, acc.last_used);
+            idx.place(
+                &email,
+                acc.valid,
+                avail,
+                acc.inflight,
+                cap,
+                na,
+                acc.last_used,
+            );
         }
 
         // 2) 選號：preferred 優先；否則取就緒堆頂（(inflight,last_used) 最小者）。
@@ -520,22 +604,34 @@ impl AccountPool {
 
         // 3) 佔用（欄位寫入 + 索引重置同臨界區，無 TOCTOU）。
         let &pos = idx.pos.get(&email).expect("chosen email 必有 pos");
-        let token = {
+        let (token, cookies) = {
             let acc = &mut accounts[pos];
             acc.inflight += 1;
             acc.last_used = now;
             acc.last_request_started = now + jitter;
-            acc.token.clone()
+            (acc.token.clone(), acc.cookies.clone())
         };
         *global_in_use += 1;
         // interval>0 時 next_available_at>now → 落入 cooldown；interval==0 且 inflight<cap → 仍 ready。
         let acc = &accounts[pos];
         let avail = acc.is_available(min_ms);
         let na = acc.next_available_at(min_ms);
-        idx.place(&email, acc.valid, avail, acc.inflight, cap, na, acc.last_used);
+        idx.place(
+            &email,
+            acc.valid,
+            avail,
+            acc.inflight,
+            cap,
+            na,
+            acc.last_used,
+        );
         // 註：sticky_email 為 preferred 親和用，目前熱路徑 preferred 恆為 None（未啟用），索引版不維護之。
 
-        Some(AccountHandle { email, token })
+        Some(AccountHandle {
+            email,
+            token,
+            cookies,
+        })
     }
 
     /// 阻塞取得帳號（有截止時間）。
@@ -641,7 +737,12 @@ impl AccountPool {
             let mut st = self.state.lock().await;
             if let Some(pos) = account_pos(&st, email) {
                 let a = &mut st.accounts[pos];
-                a.status_code = if reason.is_empty() { "auth_error" } else { reason }.to_string();
+                a.status_code = if reason.is_empty() {
+                    "auth_error"
+                } else {
+                    reason
+                }
+                .to_string();
                 a.consecutive_failures += 1;
                 if !err.is_empty() {
                     a.last_error = err.to_string();
@@ -797,11 +898,15 @@ impl AccountPool {
     /// 目前並發設定 (max_inflight_per_account, global_max_inflight, max_queue_size)。
     pub async fn concurrency_config(&self) -> (i64, i64, i64) {
         let st = self.state.lock().await;
-        (st.max_inflight_per_account, st.global_max_inflight, st.max_queue_size)
+        (
+            st.max_inflight_per_account,
+            st.global_max_inflight,
+            st.max_queue_size,
+        )
     }
 
     /// 所有可用帳號 (email, token)（給預熱池 bootstrap 用）。
-    pub async fn all_emails_tokens(&self) -> Vec<(String, String)> {
+    pub async fn all_emails_tokens(&self) -> Vec<(String, String, String)> {
         let now = now_secs();
         self.state
             .lock()
@@ -809,7 +914,7 @@ impl AccountPool {
             .accounts
             .iter()
             .filter(|a| a.valid && a.rate_limited_until <= now && !a.token.is_empty())
-            .map(|a| (a.email.clone(), a.token.clone()))
+            .map(|a| (a.email.clone(), a.token.clone(), a.cookies.clone()))
             .collect()
     }
 }
@@ -818,8 +923,21 @@ impl AccountPool {
 mod tests {
     use super::*;
 
-    fn mk(email: &str, valid: bool, inflight: i64, rl_until: f64, started: f64, finished: f64) -> Account {
-        let mut a = Account::new(email.into(), String::new(), format!("tok-{email}"), String::new(), String::new());
+    fn mk(
+        email: &str,
+        valid: bool,
+        inflight: i64,
+        rl_until: f64,
+        started: f64,
+        finished: f64,
+    ) -> Account {
+        let mut a = Account::new(
+            email.into(),
+            String::new(),
+            format!("tok-{email}"),
+            String::new(),
+            String::new(),
+        );
         a.valid = valid;
         a.inflight = inflight;
         a.rate_limited_until = rl_until;
@@ -839,7 +957,11 @@ mod tests {
                 admin_global: None,
                 sticky_email: None,
                 use_index,
-                idx: if use_index { Some(ReadyIndex::new()) } else { None },
+                idx: if use_index {
+                    Some(ReadyIndex::new())
+                } else {
+                    None
+                },
                 built_gen: 0,
             }),
             waiting: AtomicUsize::new(0),
@@ -874,10 +996,10 @@ mod tests {
         let accounts = vec![
             mk("a", true, 0, 0.0, 0.0, 0.0),
             mk("b", true, 0, 0.0, 0.0, 0.0),
-            mk("c", false, 0, 0.0, 0.0, 0.0),                 // 失效
-            mk("d", true, 0, now + 9999.0, 0.0, 0.0),         // 限流中
-            mk("e", true, 1, 0.0, 0.0, 0.0),                  // inflight=1 (cap=2 仍可)
-            mk("f", true, 2, 0.0, 0.0, 0.0),                  // 已達 cap=2
+            mk("c", false, 0, 0.0, 0.0, 0.0),         // 失效
+            mk("d", true, 0, now + 9999.0, 0.0, 0.0), // 限流中
+            mk("e", true, 1, 0.0, 0.0, 0.0),          // inflight=1 (cap=2 仍可)
+            mk("f", true, 2, 0.0, 0.0, 0.0),          // 已達 cap=2
             mk("g", true, 0, 0.0, 0.0, 0.0),
         ];
         let cap = 2;
@@ -892,8 +1014,17 @@ mod tests {
                 let pos = st.accounts.iter().position(|a| a.email == h.email).unwrap();
                 let a = &st.accounts[pos];
                 assert!(a.valid, "取出失效帳號 {}", h.email);
-                assert!(a.inflight <= cap, "超過 cap: {} inflight={}", h.email, a.inflight);
-                assert!(a.rate_limited_until <= now_secs(), "取出限流帳號 {}", h.email);
+                assert!(
+                    a.inflight <= cap,
+                    "超過 cap: {} inflight={}",
+                    h.email,
+                    a.inflight
+                );
+                assert!(
+                    a.rate_limited_until <= now_secs(),
+                    "取出限流帳號 {}",
+                    h.email
+                );
                 n += 1;
                 assert!(n < 1000, "疑似無限迴圈");
             }
@@ -989,7 +1120,8 @@ mod tests {
         }
 
         // 非 auth_error reason 必須立即失效（pending_activation 不該享受門檻）。
-        pool.mark_invalid("t", "pending_activation", "尚未激活").await;
+        pool.mark_invalid("t", "pending_activation", "尚未激活")
+            .await;
         {
             let st = pool.state.lock().await;
             let a = &st.accounts[account_pos(&st, "t").unwrap()];
@@ -1017,7 +1149,9 @@ mod tests {
             a.token = "OLD".to_string();
         }
 
-        let ok = pool.replace_token("r", "NEW_209_CHAR_JWT".to_string()).await;
+        let ok = pool
+            .replace_token("r", "NEW_209_CHAR_JWT".to_string())
+            .await;
         assert!(ok);
 
         let st = pool.state.lock().await;
@@ -1035,7 +1169,9 @@ mod tests {
     #[tokio::test]
     async fn replace_token_unknown_email_is_noop() {
         let pool = test_pool(vec![mk("x", true, 0, 0.0, 0.0, 0.0)], true, 0, 2);
-        let ok = pool.replace_token("nonexistent@nope", "X".to_string()).await;
+        let ok = pool
+            .replace_token("nonexistent@nope", "X".to_string())
+            .await;
         assert!(!ok);
     }
 
@@ -1083,14 +1219,22 @@ mod tests {
             } else {
                 Loc::Cooldown
             };
-            assert_eq!(idx.loc.get(&a.email).copied(), Some(expected), "{} loc 不一致", a.email);
+            assert_eq!(
+                idx.loc.get(&a.email).copied(),
+                Some(expected),
+                "{} loc 不一致",
+                a.email
+            );
         }
         // ready 堆中 loc 仍為 Ready 者，必須真的可取
         for Reverse((_, _, email)) in &idx.ready {
             if idx.loc.get(email) == Some(&Loc::Ready) {
                 let pos = idx.pos[email];
                 let a = &st.accounts[pos];
-                assert!(a.valid && a.is_available(min_ms) && a.inflight < cap, "ready 含不可用帳號 {email}");
+                assert!(
+                    a.valid && a.is_available(min_ms) && a.inflight < cap,
+                    "ready 含不可用帳號 {email}"
+                );
             }
         }
     }
@@ -1104,7 +1248,9 @@ mod tests {
         let cap = 2i64;
         // min_interval=0：無風控冷卻 → 不變式時間穩定（rate-limit 冷卻 600s 不會於測試內到期）。
         let min_ms = 0u64;
-        let accounts: Vec<Account> = (0..n).map(|i| mk(&format!("acc{i}"), true, 0, 0.0, 0.0, 0.0)).collect();
+        let accounts: Vec<Account> = (0..n)
+            .map(|i| mk(&format!("acc{i}"), true, 0, 0.0, 0.0, 0.0))
+            .collect();
         let pool = test_pool(accounts, true, min_ms, cap);
         let emails: Vec<String> = (0..n).map(|i| format!("acc{i}")).collect();
         let ex = HashSet::new();
@@ -1148,7 +1294,11 @@ mod tests {
             }
             let st = pool.state.lock().await;
             check_consistency(&st, min_ms);
-            assert_eq!(st.global_in_use, held.len() as i64, "global_in_use 與持有數不符");
+            assert_eq!(
+                st.global_in_use,
+                held.len() as i64,
+                "global_in_use 與持有數不符"
+            );
         }
     }
 
@@ -1164,6 +1314,10 @@ mod tests {
         let mut st = pool.state.try_lock().unwrap();
         let ex = HashSet::new();
         let h = pool.acquire_locked(&mut st, None, &ex);
-        assert_eq!(h.map(|h| h.email), Some("b".to_string()), "應選 inflight 最少的 b");
+        assert_eq!(
+            h.map(|h| h.email),
+            Some("b".to_string()),
+            "應選 inflight 最少的 b"
+        );
     }
 }

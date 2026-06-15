@@ -105,6 +105,7 @@ impl ChatIdPool {
         self: &Arc<Self>,
         email: &str,
         token: &str,
+        cookies: &str,
         _model: &str,
     ) -> Option<String> {
         let ttl = self.ttl() as f64;
@@ -144,13 +145,13 @@ impl ChatIdPool {
         }
 
         // 即時回補（消費即補；未命中亦補以暖機新熱帳號）
-        self.spawn_refill(email.to_string(), token.to_string());
+        self.spawn_refill(email.to_string(), token.to_string(), cookies.to_string());
 
         result
     }
 
     /// 對指定帳號補滿至 target（背景任務）。以 pending 佔位避免並發過量；用傳入 token，不查帳號池。
-    fn spawn_refill(self: &Arc<Self>, email: String, token: String) {
+    fn spawn_refill(self: &Arc<Self>, email: String, token: String, cookies: String) {
         let target = self.target();
         if target == 0 || self.is_waf_paused() || email.is_empty() || token.is_empty() {
             return;
@@ -173,7 +174,7 @@ impl ChatIdPool {
             for _ in 0..need {
                 match this
                     .client
-                    .create_chat(&token, &this.default_model, "t2t")
+                    .create_chat_with_cookies(&token, &cookies, &this.default_model, "t2t")
                     .await
                 {
                     Ok(cid) => {
@@ -297,8 +298,8 @@ impl ChatIdPool {
         let max_accounts = self.max_accounts.load(Ordering::Relaxed);
         let mut accounts = self.pool.all_emails_tokens().await;
         accounts.truncate(max_accounts);
-        for (email, token) in accounts {
-            self.spawn_refill(email, token);
+        for (email, token, cookies) in accounts {
+            self.spawn_refill(email, token, cookies);
         }
     }
 }
