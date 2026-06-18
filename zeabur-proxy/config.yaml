@@ -1,5 +1,5 @@
 # Mihomo 配置 — Zeabur 旁路代理
-# 订阅链接通过环境变量 SUB_URL 传入，避免 token 泄露
+# 节点来源：Mesl 机场，优选家宽 + 低倍率节点
 
 mixed-port: 7890
 allow-lan: true
@@ -7,24 +7,82 @@ mode: rule
 log-level: info
 external-controller: 0.0.0.0:9090
 
-proxy-providers:
-  mesl:
-    type: http
-    url: "${SUB_URL}"
-    interval: 3600
-    header:
-      User-Agent:
-        - "clash-verge/2.0.0"
-    health-check:
-      enable: true
-      url: https://www.gstatic.com/generate_204
-      interval: 300
+proxies:
+  # --- 台湾家宽（阿里云 WAF 对家宽 IP 最友好）---
+  - name: "台湾-家宽-01"
+    type: ss
+    server: vnuio1sadbn34a.911-gt3-rs.com
+    port: 10153
+    cipher: aes-128-gcm
+    password: "2616fa8e-8b8b-4a9a-a745-2e9cf46839ab"
+  - name: "台湾-家宽-02"
+    type: ss
+    server: vnuio1sadbn34a.911-gt3-rs.com
+    port: 10155
+    cipher: aes-128-gcm
+    password: "2616fa8e-8b8b-4a9a-a745-2e9cf46839ab"
+  # --- 日本家宽 ---
+  - name: "日本-家宽-01"
+    type: ss
+    server: vnuio1sadbn24a.911-gt3-rs.com
+    port: 11104
+    cipher: aes-128-gcm
+    password: "2616fa8e-8b8b-4a9a-a745-2e9cf46839ab"
+  - name: "日本-家宽-02"
+    type: ss
+    server: vnuio1sadbn24a.911-gt3-rs.com
+    port: 11100
+    cipher: aes-128-gcm
+    password: "2616fa8e-8b8b-4a9a-a745-2e9cf46839ab"
+  # --- 美国家宽 ---
+  - name: "美国-家宽"
+    type: ss
+    server: vnuio1sadbn24a.911-gt3-rs.com
+    port: 11071
+    cipher: aes-128-gcm
+    password: "2616fa8e-8b8b-4a9a-a745-2e9cf46839ab"
+  # --- 低倍率节点 (0.3X) ---
+  - name: "台湾-03X"
+    type: ss
+    server: vnuio1sadbn34a.911-gt3-rs.com
+    port: 10030
+    cipher: aes-128-gcm
+    password: "2616fa8e-8b8b-4a9a-a745-2e9cf46839ab"
+  - name: "香港-03X"
+    type: ss
+    server: vnuio1sadbn34a.911-gt3-rs.com
+    port: 10010
+    cipher: aes-128-gcm
+    password: "2616fa8e-8b8b-4a9a-a745-2e9cf46839ab"
+  - name: "日本-03X"
+    type: ss
+    server: vnuio1sadbn34a.911-gt3-rs.com
+    port: 10281
+    cipher: aes-128-gcm
+    password: "2616fa8e-8b8b-4a9a-a745-2e9cf46839ab"
+  - name: "新加坡-03X"
+    type: ss
+    server: vnuio1sadbn34a.911-gt3-rs.com
+    port: 10012
+    cipher: aes-128-gcm
+    password: "2616fa8e-8b8b-4a9a-a745-2e9cf46839ab"
 
 proxy-groups:
   - name: PROXY
-    type: select
-    use:
-      - mesl
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    proxies:
+      - 台湾-家宽-01
+      - 台湾-家宽-02
+      - 日本-家宽-01
+      - 日本-家宽-02
+      - 美国-家宽
+      - 台湾-03X
+      - 香港-03X
+      - 日本-03X
+      - 新加坡-03X
 
 rules:
   - MATCH,PROXY
