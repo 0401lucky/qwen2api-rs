@@ -2,20 +2,20 @@
 //! 用 reqwest（rustls + http2 + 連線池）；headers 與 Python 對齊。
 
 use crate::error::{AppError, AppResult};
-use crate::upstream::ssxmod::SsxmodManager;
 use crate::util::{now_millis, uuid4};
 use arc_swap::ArcSwap;
+use rand::Rng;
 use reqwest::header::CONTENT_TYPE;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const BASE_URL: &str = "https://chat.qwen.ai";
-pub const QWEN_WEB_VERSION: &str = "0.2.64";
+pub const QWEN_WEB_VERSION: &str = "0.4.4";
 pub const BAXIA_VERSION: &str = "2.5.36";
-pub const CHROME_MAJOR_VERSION: &str = "148";
-pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
-pub const SEC_CH_UA: &str = r#""Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99""#;
+pub const CHROME_MAJOR_VERSION: &str = "149";
+pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+pub const SEC_CH_UA: &str = r#""Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24""#;
 
 pub fn qwen_request_id() -> String {
     uuid4()
@@ -299,13 +299,20 @@ fn parse_create_chat_response(
     })
 }
 
+/// 生成 cna cookie（阿里 CDN 通用会话标识，24 位字母数字混合）。
+fn generate_cna() -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..24)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .collect()
+}
+
 pub struct QwenClient {
     /// 可熱抽換的 HTTP client（切換出口代理時整個重建並 swap）。
     http: ArcSwap<reqwest::Client>,
     /// 目前顯式設定的出口代理（None = 用環境變數 / 不走代理）。
     proxy: Mutex<Option<String>>,
-    /// Qwen 网页同源请求携带的 Baxia 指纹 cookie。
-    ssxmod: SsxmodManager,
 }
 
 impl QwenClient {
@@ -314,7 +321,6 @@ impl QwenClient {
         QwenClient {
             http: ArcSwap::from_pointee(http),
             proxy: Mutex::new(proxy),
-            ssxmod: SsxmodManager::new(),
         }
     }
 
@@ -383,21 +389,24 @@ impl QwenClient {
 
     fn cookie_header(&self, token: &str, account_cookies: &str) -> String {
         let mut parts = Vec::new();
-        let account_cookies = remove_cookie(&normalize_cookie_header(account_cookies), "token");
-        if !account_cookies.is_empty() {
-            parts.push(account_cookies.clone());
+        let cleaned = remove_cookie(&normalize_cookie_header(account_cookies), "token");
+
+        // 账号自带的浏览器 Cookie（如有）原样保留。
+        if !cleaned.is_empty() {
+            parts.push(cleaned.clone());
         }
 
-        let (itna, itna2) = self.ssxmod.get();
-        if !token.trim().is_empty() && !cookie_has(&account_cookies, "token") {
+        // 始终带 token（JWT）。Qwen API 本质是 Bearer token 认证，Cookie 只是辅助。
+        if !token.trim().is_empty() && !cookie_has(&cleaned, "token") {
             parts.push(format!("token={}", token.trim()));
         }
-        if !itna.trim().is_empty() && !cookie_has(&account_cookies, "ssxmod_itna") {
-            parts.push(format!("ssxmod_itna={itna}"));
+
+        // 自动生成 cna（阿里 CDN 会话标识，24 位随机字母数字）。
+        // 账号 Cookie 里已有则不重复生成。不生成 ssxmod —— 假指纹反而触发 WAF 拦截。
+        if !cookie_has(&cleaned, "cna") {
+            parts.push(format!("cna={}", generate_cna()));
         }
-        if !itna2.trim().is_empty() && !cookie_has(&account_cookies, "ssxmod_itna2") {
-            parts.push(format!("ssxmod_itna2={itna2}"));
-        }
+
         parts.join("; ")
     }
 
