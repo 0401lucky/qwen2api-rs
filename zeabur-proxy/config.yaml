@@ -12,6 +12,9 @@ proxy-providers:
     type: http
     url: "${SUB_URL}"
     interval: 3600
+    header:
+      User-Agent:
+        - "clash-verge/2.0.0"
     health-check:
       enable: true
       url: https://www.gstatic.com/generate_204
