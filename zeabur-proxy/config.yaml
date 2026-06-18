@@ -1,0 +1,27 @@
+# Mihomo 配置 — Zeabur 旁路代理
+# 订阅链接通过环境变量 SUB_URL 传入，避免 token 泄露
+
+mixed-port: 7890
+allow-lan: true
+mode: rule
+log-level: info
+external-controller: 0.0.0.0:9090
+
+proxy-providers:
+  mesl:
+    type: http
+    url: "${SUB_URL}"
+    interval: 3600
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    use:
+      - mesl
+
+rules:
+  - MATCH,PROXY
